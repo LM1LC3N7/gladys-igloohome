@@ -1,45 +1,79 @@
 // -----------------------------------------------------------------------------
-// Integration configuration.
-//
-// The configuration is filled in by the user in Gladys, from the `config_schema`
-// declared in `gladys-assistant-integration.json`. The SDK fetches it for you
-// (`gladys.getConfig()`) and notifies you of every change through
-// `gladys.onConfigUpdated()`.
-//
-// This module only provides defaults and normalizes the received object, so the
-// rest of the code never has to deal with `undefined`.
+// The configuration: the manifest `config_schema` values, normalized so the
+// rest of the code never deals with strings typed in a form. The client
+// secret is kept here and in the client only: never logged, never in /data
+// (only the salted fingerprint of a pair igloohome REFUSED, see
+// src/store.js), never in a status or an error.
 // -----------------------------------------------------------------------------
 
-// Defaults: they MUST stay consistent with the `default` values declared in the
-// `config_schema` of the manifest.
+import { POLL_INTERVAL } from './constants.js';
+
+/** Defaults, mirrored by the manifest (checked by test/manifest.test.js). */
 export const DEFAULT_CONFIG = {
-  latitude: 48.8566, // Paris
-  longitude: 2.3522,
-  unit: 'celsius', // 'celsius' | 'fahrenheit'
-  // Seconds between two reads of the polled sensors. Gladys polls at most once
-  // a minute: slower intervals are applied by skipping polls (see
-  // createPoller in src/devices/index.js).
-  poll_frequency: 300,
-  // Reserved key (NOT in config_schema): because the manifest declares both
-  // 'local' and 'cloud' in its `transports` field, Gladys shows a standard
-  // "Prefer the local connection" toggle and sends the user's choice here.
-  // Read-only for the integration; defaults to true.
-  GLADYS_PREFER_LOCAL: true,
+  poll_interval: POLL_INTERVAL.default,
+  allow_unlock: false,
+  language: 'fr',
 };
 
-/**
- * Merge the user config with the defaults.
- * @param {Record<string, unknown>} raw config returned by the SDK
- */
+/** The fields without a default in the manifest (the secret is a secret). */
+const OPTIONAL = { client_id: '', client_secret: '' };
+
+/** Printable ASCII without spaces: what an OAuth client id or secret is made of. */
+const CREDENTIAL = /^[\x21-\x7e]+$/;
+
+/** Only `true` (or the text "true") allows: anything else, missing included, refuses. */
+const strictTrue = (value) => value === true || value === 'true';
+
+/** A number typed in the form: a finite number, or undefined ('' and null are not 0). */
+export function numberOf(value) {
+  if (typeof value === 'number') {
+    return Number.isFinite(value) ? value : undefined;
+  }
+  if (typeof value === 'string' && /^\s*-?\d{1,6}(\.\d{1,6})?\s*$/.test(value)) {
+    return Number(value);
+  }
+  return undefined;
+}
+
+const bounded = (value, { default: fallback, min, max }) => {
+  const number = numberOf(value);
+  return number === undefined ? fallback : Math.min(max, Math.max(min, Math.round(number)));
+};
+
 export function normalizeConfig(raw = {}) {
+  const c = { ...DEFAULT_CONFIG, ...OPTIONAL };
+  for (const [key, value] of Object.entries(raw ?? {})) {
+    if (Object.hasOwn(c, key) && value != null) {
+      c[key] = value;
+    }
+  }
+  const clientId = typeof c.client_id === 'string' ? c.client_id.trim() : '';
+  const clientSecret = typeof c.client_secret === 'string' ? c.client_secret.trim() : '';
+  let badAuth;
+  if (clientId === '' || clientSecret === '') {
+    badAuth = 'missing';
+  } else if (
+    clientId.length > 128 ||
+    clientSecret.length > 256 ||
+    clientId.includes(':') ||
+    !CREDENTIAL.test(clientId) ||
+    !CREDENTIAL.test(clientSecret)
+  ) {
+    badAuth = 'invalid';
+  }
   return {
-    ...DEFAULT_CONFIG,
-    ...raw,
-    // Force the types: config may arrive as strings from a form.
-    latitude: Number(raw.latitude ?? DEFAULT_CONFIG.latitude),
-    longitude: Number(raw.longitude ?? DEFAULT_CONFIG.longitude),
-    poll_frequency: Number(raw.poll_frequency ?? DEFAULT_CONFIG.poll_frequency),
-    // The preference is a boolean; anything but an explicit false means true.
-    GLADYS_PREFER_LOCAL: raw.GLADYS_PREFER_LOCAL !== false,
+    /** `{ clientId, clientSecret }`, or undefined (missing or unusable: said in the status). */
+    auth: badAuth ? undefined : { clientId, clientSecret },
+    badAuth,
+    allowUnlock: strictTrue(c.allow_unlock),
+    pollInterval: bounded(c.poll_interval, POLL_INTERVAL),
+    language: c.language === 'en' ? 'en' : 'fr',
   };
 }
+
+/** What the credentials are (compared in memory only, never stored as is). */
+export const credentialsKey = (config) =>
+  JSON.stringify([config.auth?.clientId ?? '', config.auth?.clientSecret ?? '']);
+
+/** The account: the client id only (its salted fingerprint ties /data to it). */
+export const accountKey = (config) => config.auth?.clientId ?? '';
