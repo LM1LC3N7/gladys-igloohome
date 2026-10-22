@@ -10,6 +10,8 @@ the notes of the version's GitHub Release.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-22
+
 ### Added
 
 - igloohome locks, padlocks, key boxes and keypads through the official
@@ -46,3 +48,6 @@ the notes of the version's GitHub Release.
   Discovery tab at once, and the "connected" status and the badges when the
   last read before the restart succeeded.
 - English and French texts and guides, cover image.
+
+[Unreleased]: https://github.com/LM1LC3N7/gladys-igloohome/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/LM1LC3N7/gladys-igloohome/releases/tag/v0.1.1

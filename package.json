@@ -1,6 +1,6 @@
 {
   "name": "gladys-igloohome",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Gladys Assistant external integration for igloohome locks, padlocks and key boxes, through the official igloohome API (iglooaccess). Unofficial, not affiliated with igloohome.",
   "type": "module",
