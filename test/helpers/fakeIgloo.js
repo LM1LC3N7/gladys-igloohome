@@ -119,6 +119,9 @@ export function fakeIgloo({ clock = fakeClock() } = {}) {
     jobResponse: {},
     /** The status answers about another job id (a mix-up). */
     wrongJobId: false,
+    /** igloohome's clock minus ours (ms); no Date header at all. */
+    serverOffset: 0,
+    noDate: false,
     issued: new Set(),
   };
   let tokens = 0;
@@ -216,7 +219,7 @@ export function fakeIgloo({ clock = fakeClock() } = {}) {
         device,
         bridge,
         completed: cloud.completeAtOnce,
-        expiry: new Date(clock.now() + cloud.jobLife).toISOString(),
+        expiry: new Date(clock.now() + cloud.serverOffset + cloud.jobLife).toISOString(),
       });
       return json(200, { jobId });
     }
@@ -227,13 +230,21 @@ export function fakeIgloo({ clock = fakeClock() } = {}) {
         return json(404, { message: 'not found' });
       }
       call.jobId = jobId;
-      return json(200, {
-        jobId: cloud.wrongJobId ? 'job-other' : jobId,
-        expiryDate: job.expiry,
-        completed: cloud.wrongJobId ? true : job.completed,
-        jobType: String(job.type),
-        jobResponse: cloud.jobResponse,
-      });
+      // igloohome's own time, in the Date header (seconds).
+      const date = cloud.noDate
+        ? {}
+        : { date: new Date(clock.now() + cloud.serverOffset).toUTCString() };
+      return json(
+        200,
+        {
+          jobId: cloud.wrongJobId ? 'job-other' : jobId,
+          expiryDate: job.expiry,
+          completed: cloud.wrongJobId ? true : job.completed,
+          jobType: String(job.type),
+          jobResponse: cloud.jobResponse,
+        },
+        date,
+      );
     }
     return json(404, {});
   };

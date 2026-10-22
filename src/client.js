@@ -67,6 +67,20 @@ export function expiryOf(json, value, now) {
   return now + TIMINGS.tokenDefaultLifetime;
 }
 
+/**
+ * igloohome's time from the Date header of an answer (ms), or undefined:
+ * missing, not a date, or more than a day away from our clock (not trusted).
+ */
+export function serverTimeOf(headers, now) {
+  const value = headers?.date;
+  const text = Array.isArray(value) ? value[0] : value;
+  if (typeof text !== 'string' || text.length > 64) {
+    return undefined;
+  }
+  const ms = Date.parse(text);
+  return Number.isFinite(ms) && Math.abs(ms - now) <= DAY ? ms : undefined;
+}
+
 /** An HTTP status of the API -> an IglooError (the answer reached igloohome). */
 function apiError(response) {
   const { status } = response;
@@ -254,8 +268,12 @@ export class IglooClient {
     return value;
   }
 
-  /** One Bearer request; a 401 drops the token (the next call asks a new one). */
-  async api(method, path, token, { body, timeout, sendWithin, beforeSend } = {}) {
+  /** One Bearer request -> its JSON; a 401 drops the token (the next call asks a new one). */
+  async api(method, path, token, options = {}) {
+    return jsonOf(await this.call(method, path, token, options));
+  }
+
+  async call(method, path, token, { body, timeout, sendWithin, beforeSend } = {}) {
     const response = await this.request({
       method,
       url: `${API.baseUrl}${path}`,
@@ -275,7 +293,7 @@ export class IglooClient {
       }
       throw apiError(response);
     }
-    return jsonOf(response);
+    return response;
   }
 
   /** `GET /devices` (the token asked first if needed). */
@@ -304,13 +322,22 @@ export class IglooClient {
     }
   }
 
-  /** `GET /jobs/{id}` -> `{ id, completed, expiry?, responseKeys }`. */
+  /**
+   * `GET /jobs/{id}` -> `{ id, completed, expiry?, responseKeys, serverNow? }`,
+   * `serverNow` being igloohome's time (the Date header of the answer).
+   */
   async job(token, jobId, { timeout }) {
-    const json = await this.api('GET', `/jobs/${encodeURIComponent(jobId)}`, token, { timeout });
+    const response = await this.call('GET', `/jobs/${encodeURIComponent(jobId)}`, token, {
+      timeout,
+    });
+    const json = jsonOf(response);
+    let job;
     try {
-      return parseJob(json);
+      job = parseJob(json);
     } catch {
       throw new IglooError('invalid', { status: 200, sent: true });
     }
+    const serverNow = serverTimeOf(response.headers, this.now());
+    return serverNow === undefined ? job : { ...job, serverNow };
   }
 }

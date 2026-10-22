@@ -130,6 +130,9 @@ export class IglooApp {
     /** lock -> the jobId of its latest command (only it writes the last-command text). */
     this.latestJob = new Map();
     /** lock -> when its last lock job left (an unlock processed before it raises an alert). */
+    /** Locks where an unlock sent before a lock was processed (kept in /data). */
+    this.alerts = new Set();
+    /** lock -> when its last lock job left (in this process: an unlock answered after it). */
     this.lastLockSentAt = new Map();
     /** lock -> { en, fr }: the last-command text. */
     this.lastTexts = new Map();
@@ -260,6 +263,8 @@ export class IglooApp {
         this.memory.locks = [];
         this.memory.guards = [];
         this.memory.jobs = [];
+        this.memory.jobsOver = [];
+        this.memory.alerts = [];
         this.memory.bridgeJobs = [];
         this.memory.summary = null;
         this.memory.okAt = 0;
@@ -289,13 +294,28 @@ export class IglooApp {
       ]),
     );
     this.bridgeJobs = new Map(this.memory.bridgeJobs.map((j) => [j.bridge, j.at]));
+    this.alerts = new Set(this.memory.alerts);
     this.jobs = new Map();
+    // The latest command of each lock among the jobs kept, watched or over.
+    const latest = new Map();
+    const over = this.memory.jobsOver ?? [];
+    delete this.memory.jobsOver;
+    for (const job of [...over, ...this.memory.jobs]) {
+      const previous = latest.get(job.lock);
+      if (!previous || previous.sentAt <= job.sentAt) {
+        latest.set(job.lock, job);
+      }
+    }
     for (const job of this.memory.jobs) {
       const reads = TIMINGS.jobFollowUps.filter((d) => job.sentAt + d <= now).length;
       this.jobs.set(job.id, { ...job, reads });
-      const latest = this.jobs.get(this.latestJob.get(job.lock));
-      if (!latest || latest.sentAt <= job.sentAt) {
-        this.latestJob.set(job.lock, job.id);
+    }
+    for (const [lock, job] of latest) {
+      if (this.jobs.has(job.id)) {
+        this.latestJob.set(lock, job.id);
+      } else {
+        // Its watch ended while the container was stopped: never left "waiting".
+        this.lastTexts.set(lock, this.withAlert(lock, LAST.unknown(job.action)));
       }
     }
     const summary = this.memory.summary;
@@ -303,9 +323,25 @@ export class IglooApp {
       this.devices = new Map(summary.devices.map((d) => [d.id, d]));
       this.more = summary.more;
       this.readAt = this.memory.okAt;
-      this.online = true;
       this.stale = true;
+      if (this.memory.okAt >= this.memory.lastAttemptAt) {
+        this.online = true;
+      } else {
+        // The last read before the restart failed: not "connected".
+        this.online = false;
+        this.error = 'restart';
+      }
     }
+  }
+
+  /** A last-command text, with the late-unlock alert when the lock has one. */
+  withAlert(lock, text) {
+    return this.alerts.has(lock) ? join(text, LAST.lateUnlock) : text;
+  }
+
+  persistAlerts() {
+    this.memory.alerts = [...this.alerts];
+    this.saveMemory().catch(() => {});
   }
 
   /**
@@ -633,10 +669,9 @@ export class IglooApp {
         this.memory.summary = summary;
         dirty = true;
       }
-      if (this.now() - this.memory.okAt >= TIMINGS.attemptPersistEvery || dirty) {
-        this.memory.okAt = this.now();
-        dirty = true;
-      }
+      // Every success (reads are an interval apart, 5 min at least): after a
+      // restart, okAt >= lastAttemptAt tells the last read succeeded.
+      this.memory.okAt = this.now();
     }
     if (dirty || save) {
       await this.saveMemory();
@@ -696,6 +731,9 @@ export class IglooApp {
     }
     if (this.paused) {
       return [false, T.paused(age(this.memory.pause.until - this.now()))];
+    }
+    if (this.online === false && this.error === 'restart') {
+      return [false, T.failedBeforeRestart(age(Math.max(0, this.earliestRead() - this.now())))];
     }
     if (this.online === false) {
       return [false, T.unreachable(this.error ?? 'error', age(this.wait ?? this.interval))];
@@ -1209,7 +1247,19 @@ export class IglooApp {
       answerBy,
       check: () => {
         check();
+        // The unlocks of this lock still watched now left before this lock:
+        // if one is processed, whatever the order of the reads, the alert.
         this.lastLockSentAt.set(lock, this.now());
+        let marked = false;
+        for (const job of this.jobs.values()) {
+          if (job.lock === lock && job.action === 'unlock' && !job.beforeLock) {
+            job.beforeLock = true;
+            marked = true;
+          }
+        }
+        if (marked) {
+          this.persistJobs();
+        }
       },
     });
   }
@@ -1236,6 +1286,10 @@ export class IglooApp {
             check();
             sentAt = this.now();
             this.noteBridgeJob(bridge);
+            // A new command: the alert of the previous ones is answered.
+            if (this.alerts.delete(lock)) {
+              this.persistAlerts();
+            }
             if (unlock) {
               // Set before the first byte (written to /data right after):
               // a restart never lets a second unlock through.
@@ -1301,7 +1355,12 @@ export class IglooApp {
     this.latestJob.set(lock, jobId);
     this.setLastText(lock, LAST.accepted(action));
     this.logger.info(`${name} accepted by igloohome`);
-    this.trackJob({ id: jobId, lock, action, sentAt: sentAt ?? this.now(), reads: 0 });
+    const job = { id: jobId, lock, action, sentAt: sentAt ?? this.now(), reads: 0 };
+    if (unlock && (this.lastLockSentAt.get(lock) ?? -Infinity) >= job.sentAt) {
+      // A lock left while this unlock's answer was on its way.
+      job.beforeLock = true;
+    }
+    this.trackJob(job);
     // Never "done": what a processed job means is not known yet.
     throw this.refusal(ERRORS.accepted);
   }
@@ -1319,13 +1378,16 @@ export class IglooApp {
     if (!this.memory) {
       return;
     }
-    this.memory.jobs = [...this.jobs.values()].map(({ id, lock, action, sentAt, expiry }) => ({
-      id,
-      lock,
-      action,
-      sentAt,
-      ...(expiry !== undefined ? { expiry } : {}),
-    }));
+    this.memory.jobs = [...this.jobs.values()].map(
+      ({ id, lock, action, sentAt, expiry, beforeLock }) => ({
+        id,
+        lock,
+        action,
+        sentAt,
+        ...(expiry !== undefined ? { expiry } : {}),
+        ...(beforeLock ? { beforeLock: true } : {}),
+      }),
+    );
     this.saveMemory().catch(() => {});
   }
 
@@ -1391,7 +1453,6 @@ export class IglooApp {
     job.reads += 1;
     let answered = false;
     if (!this.blocked && !this.paused && this.config.auth) {
-      const startedAt = this.now();
       let result;
       try {
         const token = await this.client.validToken({ validity: 10 * SECOND });
@@ -1415,17 +1476,24 @@ export class IglooApp {
       // Only the answer about this job counts.
       if (result && result.id === id) {
         answered = true;
-        if (result.expiry !== undefined && result.expiry !== job.expiry) {
-          job.expiry = result.expiry;
-          this.persistJobs();
-        }
         if (result.completed) {
           this.jobEnded(job, 'processed', result);
           return;
         }
-        if (result.expiry !== undefined && startedAt > result.expiry) {
-          this.jobEnded(job, 'expired');
-          return;
+        // The expiry date is igloohome's: compared with igloohome's own time
+        // (the Date header of this answer), never with our clock. Without a
+        // readable Date, never "expired" (the watch runs its 15 min).
+        if (result.expiry !== undefined && result.serverNow !== undefined) {
+          if (result.serverNow > result.expiry) {
+            this.jobEnded(job, 'expired');
+            return;
+          }
+          // The expiry on our clock, for the end of the watch.
+          const local = result.expiry - (result.serverNow - this.now());
+          if (local !== job.expiry) {
+            job.expiry = local;
+            this.persistJobs();
+          }
         }
       }
     }
@@ -1463,17 +1531,19 @@ export class IglooApp {
     } else {
       this.logger.info(`${job.lock}: ${job.action} job ${outcome}`);
     }
+    const alert = job.action === 'unlock' && outcome === 'processed' && job.beforeLock === true;
+    if (alert) {
+      // Kept until the next command of the lock, whatever ends after it.
+      this.logger.warn(`${job.lock}: an unlock sent before a lock was processed`);
+      this.alerts.add(job.lock);
+      this.persistAlerts();
+    }
     if (this.latestJob.get(job.lock) === job.id) {
       this.latestJob.delete(job.lock);
-      this.setLastText(job.lock, LAST[outcome](job.action));
+      this.setLastText(job.lock, this.withAlert(job.lock, LAST[outcome](job.action)));
       return;
     }
-    if (
-      job.action === 'unlock' &&
-      outcome === 'processed' &&
-      (this.lastLockSentAt.get(job.lock) ?? -Infinity) > job.sentAt
-    ) {
-      this.logger.warn(`${job.lock}: an unlock sent before a lock was processed after it`);
+    if (alert) {
       this.setLastText(job.lock, LAST.lateUnlock);
     }
   }

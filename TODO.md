@@ -26,6 +26,10 @@ up to date at the end of every milestone.
       I2 (every job watched to its end, late-unlock alert), I3 (restart from
       the last success), I4 (final stops), I5 (unlock scope only when
       allowed), M1 to M13.
+- [x] **Approval 1 fixes** (2026-10-22): R1 (expiry compared with
+      igloohome's Date header), R2 (late-unlock alert whatever the order,
+      kept in /data), R3 (a failed last read not restored as connected), R4
+      ("result unknown" for a command whose watch ended while stopped).
 - [ ] **Milestone 2 — real account**: run against a real iglooaccess client,
       lock and bridge (see "To check"); turn the answers (anonymized) into
       fixtures.
@@ -102,6 +106,21 @@ up to date at the end of every milestone.
   after a restart. The text follows the latest command of the lock; an unlock
   processed after a lock sent later raises an alert ("press Lock again"),
   never a resend.
+- **igloohome's time for the expiry** (approval 1, R1): `expiryDate` is
+  compared with the `Date` header of the same answer (a date more than a day
+  from our clock is ignored), never with the clock of Gladys; without a
+  readable Date, never "expired" (the watch runs its 15 min). The expiry is
+  turned into our clock with that answer's offset for the end of the watch.
+- **Late-unlock alert** (approval 1, R2): when a lock leaves, the unlock jobs
+  of that lock still watched are marked `beforeLock` (in /data); if one ends
+  processed, the lock gets an alert (in /data) shown with every last-command
+  text until the next command of the lock, whatever the order of the reads
+  and across a restart.
+- **Restart** (approval 1, R3, R4): "connected" and cloud badges are restored
+  only when `okAt >= lastAttemptAt` (the last read succeeded; `okAt` written
+  at every success); else "the last read before a restart failed". A job
+  whose 15-minute watch ended while stopped, when it was the latest command
+  of its lock, shows "result unknown".
 - **Unlock guard**: set in `beforeSend`, before the first byte, written to
   /data right after (a stop waits for the writes), bounded by the watch
   (15.5 min); lifted only by the end of its own job. While any unlock job of

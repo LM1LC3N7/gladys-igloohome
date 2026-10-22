@@ -85,13 +85,15 @@ d'exécution des tâches par le bridge n'est pas garanti.
   rien envoyer. Elle n'est **jamais annoncée réussie** : une tâche acceptée
   par igloohome est « Commande envoyée, sans confirmation ». Son état est
   ensuite relu (5, 15, 30, 60, 100, 140 s, puis chaque minute) jusqu'à ce
-  qu'igloohome la dise traitée, ou expirée par une lecture faite après sa date
-  d'expiration, ou 15 min au plus (alors « résultat inconnu : vérifiez la
-  serrure »). Ce qu'igloohome dit du résultat d'une tâche traitée n'est pas
-  encore lu (forme inconnue) : vérifiez la serrure.
-- Si un déverrouillage envoyé **avant** un verrouillage est traité après lui,
-  **Dernière commande** le signale : appuyez de nouveau sur Verrouiller
-  (jamais de renvoi automatique).
+  qu'igloohome la dise traitée, ou expirée (son heure à elle, l'en-tête `Date`
+  de sa réponse, après la date d'expiration : jamais l'horloge de Gladys), ou
+  15 min au plus (alors « résultat inconnu : vérifiez la serrure »). Ce
+  qu'igloohome dit du résultat d'une tâche traitée n'est pas encore lu (forme
+  inconnue) : vérifiez la serrure.
+- Si un déverrouillage envoyé **avant** un verrouillage est aussi traité, quel
+  que soit l'ordre, **Dernière commande** le signale jusqu'à la commande
+  suivante (même après un redémarrage) : vérifiez la serrure et appuyez de
+  nouveau sur Verrouiller (jamais de renvoi automatique).
 - Les boutons ne sont jamais des interrupteurs : un « tout éteindre » d'un
   assistant vocal ou d'une scène ne peut pas les atteindre.
 
@@ -108,8 +110,11 @@ d'exécution des tâches par le bridge n'est pas garanti.
   test (sauf lu il y a moins d'un intervalle), la Découverte, une reconnexion
   à Gladys ou un redémarrage ne relisent jamais plus vite que l'intervalle.
 - Après un redémarrage, la dernière lecture réussie gardée dans `/data`
-  donne aussitôt le statut, l'onglet Découverte et les badges, jusqu'à la
-  lecture suivante (ses valeurs ne sont pas republiées comme neuves).
+  donne aussitôt l'onglet Découverte, et le statut « connecté » et les badges
+  si la dernière lecture avant le redémarrage avait réussi (sinon le statut le
+  dit), jusqu'à la lecture suivante (ses valeurs ne sont pas republiées comme
+  neuves). Une commande dont le suivi a pris fin pendant l'arrêt affiche
+  « résultat inconnu ».
 
 ## Ce qui est gardé dans `/data`
 

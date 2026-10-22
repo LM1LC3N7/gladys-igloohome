@@ -70,8 +70,8 @@ export const LAST = {
       `${ACTION_NAMES[action].fr} : refusé par igloohome (${reason}), rien n'a été fait.`,
     ),
   lateUnlock: both(
-    'An unlock sent before the lock has just been processed by the bridge: the lock may be unlocked, press Lock again.',
-    'Un déverrouillage envoyé avant le verrouillage vient d’être traité par le bridge : la serrure peut être déverrouillée, appuyez de nouveau sur Verrouiller.',
+    'Warning: an unlock sent before the lock was also processed by the bridge, in an unknown order: the lock may be unlocked, check it and press Lock again.',
+    'Attention : un déverrouillage envoyé avant le verrouillage a aussi été traité par le bridge, dans un ordre inconnu : la serrure peut être déverrouillée, vérifiez-la et appuyez de nouveau sur Verrouiller.',
   ),
 };
 
@@ -90,6 +90,11 @@ export const T = {
     both(
       `last successful read ${ago} ago (before a restart), next in ${next}.`,
       `dernière lecture réussie il y a ${ago} (avant un redémarrage), prochaine dans ${next}.`,
+    ),
+  failedBeforeRestart: (next) =>
+    both(
+      `The last read before a restart failed; next read in ${next}.`,
+      `La dernière lecture avant un redémarrage a échoué ; prochaine lecture dans ${next}.`,
     ),
   summary: (devices, commandable) =>
     both(

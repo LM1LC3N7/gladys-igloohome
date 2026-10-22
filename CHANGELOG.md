@@ -31,15 +31,18 @@ the notes of the version's GitHub Release.
   cancelled: said in the guides).
 - Commands sent within 3.5 s or refused unsent, never answered done: a job
   accepted is "sent, without confirmation"; every job is watched until
-  igloohome says it was processed ("result not read"), or a read after its
-  expiry date says it expired, or 15 min ("result unknown"); an unlock
-  processed after a later lock raises an alert. The jobs watched survive a
-  restart.
+  igloohome says it was processed ("result not read"), or igloohome's own
+  time (the Date header) is past its expiry date, or 15 min ("result
+  unknown"); an unlock sent before a lock and processed too raises an alert
+  kept until the next command, whatever the order. The jobs watched and the
+  alerts survive a restart; a watch that ended while stopped shows "result
+  unknown".
 - Any refusal of the token endpoint but 429/5xx is a final stop (credentials
   refused or rights missing), lifted by other credentials or a success of
   the test button; a client without the unlock right still reads and locks.
   429/5xx pause from 1 min to 6 h; all kept in `/data`. Reads never sooner
   than the interval (15 min by default).
 - After a restart, the last successful read kept in `/data` gives the
-  status, the Discovery tab and the badges at once.
+  Discovery tab at once, and the "connected" status and the badges when the
+  last read before the restart succeeded.
 - English and French texts and guides, cover image.

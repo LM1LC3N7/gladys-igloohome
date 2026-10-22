@@ -102,7 +102,7 @@ test('I2: an unlock processed after a later lock raises an alert', async (t) => 
   assert.match(lastText(gladys, LOCK), /Verrouillage : tâche traitée/);
   cloud.jobs.get(unlockJob.jobId).completed = true;
   await env.advance(30_000);
-  assert.match(lastText(gladys, LOCK), /Un déverrouillage envoyé avant le verrouillage/);
+  assert.match(lastText(gladys, LOCK), /un déverrouillage envoyé avant le verrouillage a aussi/);
 });
 
 test('I3: a restart 10 s after a successful read: connected, Discovery and badges at once, no old value as new', async (t) => {

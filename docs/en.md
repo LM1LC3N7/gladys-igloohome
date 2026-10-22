@@ -79,11 +79,13 @@ guaranteed.
   anything. It is **never answered done**: a job accepted by igloohome is
   "Command sent, without confirmation". Its status is then read (5, 15, 30,
   60, 100, 140 s, then every minute) until igloohome says it was processed,
-  or expired by a read made after its expiry date, or 15 min at most (then
-  "result unknown: check the lock"). What igloohome says of the result of a
-  processed job is not read yet (unknown form): check the lock.
-- When an unlock sent **before** a lock is processed after it, **Last
-  command** says so: press Lock again (never resent by itself).
+  or expired (igloohome's own time, the `Date` header of its answer, past the
+  expiry date: never the clock of Gladys), or 15 min at most (then "result
+  unknown: check the lock"). What igloohome says of the result of a processed
+  job is not read yet (unknown form): check the lock.
+- When an unlock sent **before** a lock is processed too, whatever the order,
+  **Last command** says so until the next command (a restart included):
+  check the lock and press Lock again (never resent by itself).
 - The buttons are never switches: a "turn everything off" of a voice assistant
   or a scene cannot reach them.
 
@@ -98,9 +100,11 @@ guaranteed.
 - Other errors: a new try at the interval (5 min at least). The test button
   (unless read less than an interval ago), the Discovery tab, a reconnection
   to Gladys or a restart never read sooner than the interval.
-- After a restart, the last successful read kept in `/data` gives the status,
-  the Discovery tab and the badges at once, until the next read (its values
-  are not republished as new).
+- After a restart, the last successful read kept in `/data` gives the
+  Discovery tab at once, and the "connected" status and the badges when the
+  last read before the restart succeeded (else the status says so), until the
+  next read (its values are not republished as new). A command whose watch
+  ended while stopped shows "result unknown".
 
 ## What is kept in `/data`
 

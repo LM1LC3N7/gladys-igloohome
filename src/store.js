@@ -19,7 +19,9 @@
 //     its values are never republished as new;
 //   - `locks`: the deviceId of each commandable lock and of its bridge;
 //   - `guards`: after an unlock that may have left, its end and its job id;
-//   - `jobs`: the jobs watched (id, lock, action, sent at, expiry);
+//   - `jobs`: the jobs watched (id, lock, action, sent at, expiry on our
+//     clock, `beforeLock` for an unlock watched when a lock left);
+//   - `alerts`: the locks where an unlock sent before a lock was processed;
 //   - `bridgeJobs`: when the last job was sent to each bridge (2 a minute).
 // NO SECRET: neither the client secret, nor the token, nor anything derived
 // from a pair igloohome accepted. The file is readable by the container user
@@ -99,6 +101,7 @@ export function normalizeMemory(raw, now) {
   const pause = object(data.pause);
   const block = object(data.block);
   const failures = Number.isInteger(block.failures) && block.failures > 0 ? block.failures : 1;
+  const { jobs, over } = jobsOf(data.jobs, now);
   return {
     salt:
       typeof data.salt === 'string' && /^[0-9a-f]{32}$/.test(data.salt)
@@ -121,7 +124,10 @@ export function normalizeMemory(raw, now) {
     summary: summaryOf(data.summary),
     locks: locksOf(data.locks),
     guards: guardsOf(data.guards, now),
-    jobs: jobsOf(data.jobs, now),
+    jobs,
+    /** Not saved back: read once by the restore. */
+    jobsOver: over,
+    alerts: alertsOf(data.alerts),
     bridgeJobs: bridgeJobsOf(data.bridgeJobs, now),
   };
 }
@@ -198,8 +204,13 @@ function guardsOf(raw, now) {
   return out;
 }
 
+/**
+ * The jobs watched, and (`over`) those whose watch ended while the
+ * container was stopped (src/app.js says "result unknown" for them).
+ */
 function jobsOf(raw, now) {
-  const out = [];
+  const jobs = [];
+  const over = [];
   const seen = new Set();
   for (const entry of Array.isArray(raw) ? raw.slice(0, TIMINGS.jobsMax) : []) {
     const job = object(entry);
@@ -209,17 +220,29 @@ function jobsOf(raw, now) {
       (job.action === 'lock' || job.action === 'unlock') &&
       Number.isFinite(job.sentAt) &&
       job.sentAt <= now &&
-      job.sentAt > now - TIMINGS.jobWatchMax &&
       !seen.has(job.id)
     ) {
       seen.add(job.id);
-      out.push({
+      const kept = {
         id: job.id,
         lock: job.lock,
         action: job.action,
         sentAt: job.sentAt,
         ...(Number.isFinite(job.expiry) ? { expiry: job.expiry } : {}),
-      });
+        ...(job.beforeLock === true ? { beforeLock: true } : {}),
+      };
+      (job.sentAt > now - TIMINGS.jobWatchMax ? jobs : over).push(kept);
+    }
+  }
+  return { jobs, over };
+}
+
+/** The locks whose last command carries the late-unlock alert. */
+function alertsOf(raw) {
+  const out = [];
+  for (const id of Array.isArray(raw) ? raw.slice(0, LIMITS.devices) : []) {
+    if (isId(id) && !out.includes(id)) {
+      out.push(id);
     }
   }
   return out;
