@@ -3,9 +3,9 @@
 // tests run the exact wiring of the container.
 // -----------------------------------------------------------------------------
 
-import { ACTIONS } from './constants.js';
+import { ACTIONS, TIMINGS } from './constants.js';
 
-export function registerHandlers(gladys, app, logger) {
+export function registerHandlers(gladys, app, logger, timers = globalThis) {
   // Discovery: the devices of the last read, sent again (never a read).
   gladys.onScanRequest(() => app.scan());
   gladys.onDeviceCreated((device) => app.deviceCreated(device));
@@ -23,11 +23,28 @@ export function registerHandlers(gladys, app, logger) {
 
   // Connection lifecycle (also after every reconnection to Gladys): the
   // status and the Discovery tab are published again, without a new read.
-  gladys.on('connected', async () => {
+  // A failed configuration read is asked again, spaced and bounded (5 s,
+  // 30 s, 2 min, 10 min): never an integration left unstarted, never a loop.
+  let retry;
+  const connect = async (attempt) => {
     try {
       await app.connected(await gladys.getConfig());
     } catch (err) {
       logger?.error('Start failed', err?.message ?? 'error');
+      const delay = TIMINGS.configRetries[attempt];
+      if (delay !== undefined) {
+        retry = timers.setTimeout(() => {
+          retry = undefined;
+          connect(attempt + 1);
+        }, delay);
+      }
     }
+  };
+  gladys.on('connected', () => {
+    if (retry) {
+      timers.clearTimeout(retry);
+      retry = undefined;
+    }
+    return connect(0);
   });
 }

@@ -6,16 +6,20 @@
 // the status of a job.
 //
 // The token is kept in memory only (never in /data, never logged); one token
-// request at a time (a second caller joins it); the app renews it ahead of
-// its expiry by a timer, so a command never waits for it. igloohome-api asks
-// a new token whenever the JWT cannot be decoded; here the expiry comes from
-// `expires_in` (else the `exp` of the JWT, else one hour), counted on our
-// clock.
+// request at a time for the reads (a second caller joins it), a lock command
+// joins it only when it left just now (else its own request, within its
+// deadline). The scopes asked are the least: the unlock scope only while
+// "Allow unlocking" is on; when the API client lacks it, the token is asked
+// once more without it, and unlocking is said impossible (the rest works).
+// The expiry comes from `expires_in` (else the `exp` of the JWT, else one
+// hour), counted on our clock.
 // -----------------------------------------------------------------------------
 
 import { API, LIMITS, SECOND, TIMINGS } from './constants.js';
 import { IglooError, httpsRequest } from './http.js';
 import { parseDevices, parseJob, parseJobCreated } from './igloo.js';
+
+const DAY = 86400 * SECOND;
 
 /** Retry-After in seconds (0 to 1 day) -> ms; a date or anything else -> undefined. */
 export function retryAfterOf(headers) {
@@ -50,6 +54,19 @@ export function jwtExpiry(token) {
   }
 }
 
+/** The expiry of a token given at `now`: `expires_in` if finite and > 0, else `exp`, else 1 h. */
+export function expiryOf(json, value, now) {
+  const expiresIn = json?.expires_in;
+  if (typeof expiresIn === 'number' && Number.isFinite(expiresIn) && expiresIn > 0) {
+    return now + Math.min(expiresIn * SECOND, DAY);
+  }
+  const exp = jwtExpiry(value);
+  if (exp !== undefined && exp > now) {
+    return Math.min(exp, now + DAY);
+  }
+  return now + TIMINGS.tokenDefaultLifetime;
+}
+
 /** An HTTP status of the API -> an IglooError (the answer reached igloohome). */
 function apiError(response) {
   const { status } = response;
@@ -75,18 +92,39 @@ export class IglooClient {
   constructor({ request = httpsRequest, now = Date.now } = {}) {
     this.request = request;
     this.now = now;
-    this.credentials = undefined;
-    /** { value, expiresAt } or undefined: memory only. */
-    this.token = undefined;
-    this.pending = undefined;
+    this.configure(undefined);
   }
 
   /** New credentials (or none): the token of the previous ones is dropped. */
-  configure(credentials) {
+  configure(credentials, { unlock = false } = {}) {
     this.credentials = credentials;
-    this.token = undefined;
-    this.tokenAt = undefined;
-    this.pending = undefined;
+    this.unlock = unlock;
+    /** The API client was refused the unlock scope (asked again after a reset). */
+    this.unlockDenied = false;
+    this.dropToken();
+  }
+
+  /** "Allow unlocking" changed (or a new try of its scope): the token goes. */
+  setUnlock(unlock) {
+    if (unlock !== this.unlock || this.unlockDenied) {
+      this.unlock = unlock;
+      this.unlockDenied = false;
+      this.dropToken();
+    }
+  }
+
+  /** The scopes to ask now. */
+  get scope() {
+    const scopes = [...API.scopes];
+    if (this.canUnlock) {
+      scopes.push(API.unlockScope);
+    }
+    return scopes.join(' ');
+  }
+
+  /** Whether the token is asked (and given) with the unlock scope. */
+  get canUnlock() {
+    return this.unlock && !this.unlockDenied;
   }
 
   /** Whether the token stays valid `ms` more. */
@@ -101,6 +139,9 @@ export class IglooClient {
 
   dropToken() {
     this.token = undefined;
+    this.tokenAt = undefined;
+    this.pending = undefined;
+    this.pendingAt = undefined;
   }
 
   /**
@@ -119,14 +160,47 @@ export class IglooClient {
       const pending = this.requestToken(this.credentials, options).finally(() => {
         if (this.pending === pending) {
           this.pending = undefined;
+          this.pendingAt = undefined;
         }
       });
       this.pending = pending;
+      this.pendingAt = this.now();
     }
     return this.pending;
   }
 
-  async requestToken(credentials, { timeout = TIMINGS.readTimeout, sendWithin } = {}) {
+  /**
+   * The token of a lock command: the request under way only when it left
+   * less than a second ago (an older one may hang); else its own, bounded by
+   * the command's deadline.
+   */
+  lockToken(options) {
+    if (this.pending && this.now() - this.pendingAt < TIMINGS.tokenJoinWindow) {
+      return this.pending;
+    }
+    return this.requestToken(this.credentials, options);
+  }
+
+  async requestToken(credentials, options = {}) {
+    const scope = this.scope;
+    try {
+      return await this.askToken(credentials, scope, options);
+    } catch (err) {
+      if (
+        err.kind === 'scope' &&
+        scope.includes(API.unlockScope) &&
+        credentials === this.credentials &&
+        this.canUnlock
+      ) {
+        // The API client lacks the unlock scope: once more without it.
+        this.unlockDenied = true;
+        return this.askToken(credentials, this.scope, options);
+      }
+      throw err;
+    }
+  }
+
+  async askToken(credentials, scope, { timeout = TIMINGS.readTimeout, sendWithin } = {}) {
     if (!credentials) {
       throw new IglooError('auth');
     }
@@ -135,10 +209,7 @@ export class IglooClient {
     const basic = Buffer.from(`${credentials.clientId}:${credentials.clientSecret}`).toString(
       'base64',
     );
-    const body = new URLSearchParams({
-      grant_type: 'client_credentials',
-      scope: API.scope,
-    }).toString();
+    const body = new URLSearchParams({ grant_type: 'client_credentials', scope }).toString();
     const response = await this.request({
       method: 'POST',
       url: API.tokenUrl,
@@ -155,7 +226,8 @@ export class IglooClient {
       throw apiError(response);
     }
     if (response.status !== 200) {
-      // OAuth2 errors (RFC 6749 5.2): only the code is read, never shown as is.
+      // Any other refusal of the token endpoint is final (lesson of lot 12):
+      // a scope missing, or the credentials (whatever the code: 400, 401, 403).
       let code;
       try {
         code = JSON.parse(response.body.toString('utf8'))?.error;
@@ -165,10 +237,7 @@ export class IglooClient {
       if (code === 'invalid_scope' || code === 'unauthorized_client') {
         throw new IglooError('scope', { status: response.status, sent: true });
       }
-      if (code === 'invalid_client' || response.status === 401) {
-        throw new IglooError('auth', { status: response.status, sent: true });
-      }
-      throw new IglooError('http', { status: response.status, sent: true });
+      throw new IglooError('auth', { status: response.status, sent: true });
     }
     const json = jsonOf(response);
     const value = json?.access_token;
@@ -176,20 +245,9 @@ export class IglooClient {
       throw new IglooError('invalid', { status: 200, sent: true });
     }
     const now = this.now();
-    const expiresIn = json.expires_in;
-    let expiresAt;
-    if (Number.isFinite(expiresIn) && expiresIn >= 60 && expiresIn <= 86400) {
-      expiresAt = now + expiresIn * SECOND;
-    } else {
-      const exp = jwtExpiry(value);
-      expiresAt =
-        exp !== undefined && exp > now + 60 * SECOND && exp <= now + 86400 * SECOND
-          ? exp
-          : now + TIMINGS.tokenDefaultLifetime;
-    }
-    // Only for the credentials it was asked with (they may have changed meanwhile).
-    if (credentials === this.credentials) {
-      this.token = { value, expiresAt };
+    // Kept only for the credentials and the scope it was asked with (they may have changed).
+    if (credentials === this.credentials && scope === this.scope) {
+      this.token = { value, expiresAt: expiryOf(json, value, now) };
       /** When the current token was given (a refusal right after it means a scope). */
       this.tokenAt = now;
     }
@@ -246,7 +304,7 @@ export class IglooClient {
     }
   }
 
-  /** `GET /jobs/{id}` -> `{ id, completed, expiry? }`. */
+  /** `GET /jobs/{id}` -> `{ id, completed, expiry?, responseKeys }`. */
   async job(token, jobId, { timeout }) {
     const json = await this.api('GET', `/jobs/${encodeURIComponent(jobId)}`, token, { timeout });
     try {

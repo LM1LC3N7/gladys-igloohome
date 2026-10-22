@@ -82,8 +82,15 @@ test('parseJob', () => {
       id: 'j1',
       completed: false,
       expiry: Date.parse('2026-10-01T10:00:00Z'),
+      responseKeys: [],
     },
   );
+  // jobResponse: its key names only, bounded, never its values.
+  const keys = Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`k${i}`, 'secret']));
+  const job = parseJob({ jobId: 'j1', completed: true, jobResponse: { 'a b!': 1, ...keys } });
+  assert.equal(job.responseKeys.length, 10);
+  assert.equal(job.responseKeys[0], 'ab');
+  assert.ok(!JSON.stringify(job).includes('secret'));
   assert.throws(() => parseJob({ jobId: 'j1', completed: 'yes' }));
   assert.throws(() => parseJob({ completed: true }));
 });
@@ -138,16 +145,45 @@ test('/data: bounded when read back', () => {
   );
   assert.match(m.salt, /^[0-9a-f]{32}$/);
   assert.equal(m.pause.until, now + TIMINGS.pauseMax);
-  assert.equal(m.block.until, now + TIMINGS.authRetries.at(-1));
+  assert.deepEqual(m.block, { kind: 'refused', failures: 2, fp: 'a'.repeat(32) }, 'final');
   assert.equal(m.lastAttemptAt, now);
   assert.deepEqual(m.locks, [{ id: 'L1', bridge: 'B1' }]);
   assert.deepEqual(m.guards, [
-    { lock: 'L1', until: now + TIMINGS.jobLifetime + TIMINGS.guardMargin, jobId: 'j1' },
+    { lock: 'L1', until: now + TIMINGS.jobWatchMax + TIMINGS.guardMargin, jobId: 'j1' },
   ]);
   assert.deepEqual(m.bridgeJobs, [{ bridge: 'B1', at: now - 1000 }]);
   const scope = normalizeMemory({ block: { kind: 'scope', fp: 'b'.repeat(32), until: 5 } }, now);
-  assert.equal(scope.block.until, null);
+  assert.equal(scope.block.kind, 'scope');
   assert.equal(normalizeMemory('garbage', now).block, null);
+  // Guards and jobs bounded by the watch; the summary by count and fields.
+  const b = normalizeMemory(
+    {
+      guards: [{ lock: 'L1', until: now + 10 * 3600_000 }],
+      jobs: [
+        { id: 'j1', lock: 'L1', action: 'unlock', sentAt: now - 1000, expiry: now + 5 },
+        { id: 'j2', lock: 'L1', action: 'open', sentAt: now },
+        { id: 'j3', lock: 'L1', action: 'lock', sentAt: now - TIMINGS.jobWatchMax - 1 },
+      ],
+      okAt: now + 99,
+      summary: {
+        devices: [
+          { id: 'L1', type: 'Lock', name: 'x\u0000y', battery: 500, bridge: 'B1', extra: 1 },
+          { id: 'bad id', type: 'Lock' },
+        ],
+        more: 'yes',
+      },
+    },
+    now,
+  );
+  assert.equal(b.guards[0].until, now + TIMINGS.jobWatchMax + TIMINGS.guardMargin);
+  assert.deepEqual(b.jobs, [
+    { id: 'j1', lock: 'L1', action: 'unlock', sentAt: now - 1000, expiry: now + 5 },
+  ]);
+  assert.equal(b.okAt, now);
+  assert.deepEqual(b.summary, {
+    devices: [{ id: 'L1', type: 'Lock', name: 'xy', bridge: 'B1' }],
+    more: false,
+  });
 });
 
 test('external ids: only ours, checked against the SDK', () => {

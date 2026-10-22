@@ -22,9 +22,10 @@ Et pour une **serrure reliée à un bridge** :
 
 - un bouton **Verrouiller** (toujours permis) ;
 - un bouton **Déverrouiller** (désactivé par défaut, voir plus bas) ;
-- **Dernière commande** : le résultat de la dernière commande, relu chez
-  igloohome (« tâche terminée par le bridge », « non confirmé, la tâche a
-  expiré »…).
+- **Dernière commande** : ce qu'igloohome dit de la tâche de la dernière
+  commande (« acceptée, en attente du bridge », « tâche traitée par le bridge
+  (résultat non lu) », « igloohome indique que la tâche a expiré », « résultat
+  inconnu »…).
 
 igloohome **ne donne pas l'état verrouillé/déverrouillé** d'une serrure :
 l'intégration n'en invente pas (Home Assistant affiche un état supposé).
@@ -37,9 +38,12 @@ l'intégration n'en invente pas (Home Assistant affiche un état supposé).
 2. Un **client API** créé dans le portail **iglooaccess** (offre plutôt
    destinée aux professionnels) : il donne un _client id_ et un _client
    secret_. Le client doit avoir les droits (scopes) `get-devices`,
-   `lock-bridge-proxied-job`, `unlock-bridge-proxied-job` et `get-job-status`.
-   **igloohome peut facturer l'usage de l'API** (par exemple par appareil
-   actif et par mois) : vérifiez les conditions de votre offre.
+   `lock-bridge-proxied-job` et `get-job-status`. Le droit
+   `unlock-bridge-proxied-job` n'est nécessaire que si vous activez le
+   déverrouillage ; sans lui, igloohome refuse lui-même tout déverrouillage
+   (le reste fonctionne, le statut le dit). **igloohome peut facturer l'usage
+   de l'API** (par exemple par appareil actif et par mois) : vérifiez les
+   conditions de votre offre.
 
 ## Configuration
 
@@ -49,7 +53,9 @@ l'intégration n'en invente pas (Home Assistant affiche un état supposé).
   en mémoire du conteneur, jamais écrit sur le disque.
 - **Autoriser le déverrouillage des serrures depuis Gladys** : désactivé par
   défaut. Activé, une scène, un tableau de bord ou un assistant vocal relié à
-  Gladys peut ouvrir votre porte.
+  Gladys peut ouvrir votre porte. Le jeton n'a le droit de déverrouiller que
+  lorsque l'option est activée (un nouveau jeton est demandé quand vous la
+  changez).
 - **Intervalle de rafraîchissement** : 900 s (15 min) par défaut, de 300 s à
   86 400 s. Une seule requête par lecture pour tout le compte.
 - **Langue des noms des fonctionnalités**.
@@ -59,50 +65,61 @@ Enregistrez, puis ajoutez les appareils depuis l'onglet **Découverte**.
 ## Les commandes et leur sécurité
 
 igloohome commande une serrure **par son bridge**, sous forme d'une « tâche »
-que le bridge exécute dans les 2 minutes (il en accepte environ 2 par minute).
+que le bridge exécute plus tard (il en accepte environ 2 par minute). **Une
+tâche déjà acceptée par igloohome ne peut pas être annulée**, et l'ordre
+d'exécution des tâches par le bridge n'est pas garanti.
 
 - **Déverrouiller** est refusé tant que l'option n'est pas activée ; l'option
   est revérifiée à l'arrivée, après la lecture et juste avant l'envoi. Avant
   d'agir, la liste des appareils est **relue chez igloohome** : la serrure
   doit y être encore, comme serrure, reliée à un bridge. Un seul
-  déverrouillage à la fois par serrure ; aucun autre tant que le précédent
-  peut encore attendre son bridge (2 min 30, gardé même après un
+  déverrouillage à la fois par serrure ; aucun autre tant que la tâche du
+  précédent est suivie (jusqu'à sa fin, 15 min au plus, gardé même après un
   redémarrage) ; aucun dans les 30 s d'une autre tâche sur le même bridge.
 - **Verrouiller** n'est jamais bloqué : pas de lecture avant, pas de file
-  d'attente, un essai même pendant une pause demandée par igloohome, et
-  possible dès le redémarrage (le bridge de chaque serrure est gardé dans
-  `/data`). Il annule aussitôt tout déverrouillage de cette serrure pas encore
-  envoyé.
+  d'attente, un essai même pendant une pause demandée par igloohome ou un
+  arrêt, et possible dès le redémarrage (le bridge de chaque serrure est gardé
+  dans `/data`). Il annule aussitôt tout déverrouillage de cette serrure pas
+  encore envoyé.
 - Une commande part dans les 3,5 s de votre clic, sinon elle est refusée sans
-  rien envoyer. Une tâche acceptée par igloohome est annoncée « Commande
-  envoyée, sans confirmation » : la confirmation vient ensuite de l'état de la
-  tâche, relu plusieurs fois pendant 2 min 20, et s'affiche dans **Dernière
-  commande**. Si la tâche est déjà terminée à la réponse, la commande est
-  confirmée tout de suite.
+  rien envoyer. Elle n'est **jamais annoncée réussie** : une tâche acceptée
+  par igloohome est « Commande envoyée, sans confirmation ». Son état est
+  ensuite relu (5, 15, 30, 60, 100, 140 s, puis chaque minute) jusqu'à ce
+  qu'igloohome la dise traitée, ou expirée par une lecture faite après sa date
+  d'expiration, ou 15 min au plus (alors « résultat inconnu : vérifiez la
+  serrure »). Ce qu'igloohome dit du résultat d'une tâche traitée n'est pas
+  encore lu (forme inconnue) : vérifiez la serrure.
+- Si un déverrouillage envoyé **avant** un verrouillage est traité après lui,
+  **Dernière commande** le signale : appuyez de nouveau sur Verrouiller
+  (jamais de renvoi automatique).
 - Les boutons ne sont jamais des interrupteurs : un « tout éteindre » d'un
   assistant vocal ou d'une scène ne peut pas les atteindre.
 
 ## Erreurs et limites de débit
 
-- **Identifiants refusés** : arrêt gardé dans `/data`, nouvel essai dans 1 h,
-  6 h puis toutes les 24 h ; aussitôt avec d'autres identifiants ; le bouton
-  **Tester la connexion** réessaie une fois et ne lève l'arrêt qu'en cas de
-  succès.
-- **Droits (scopes) manquants** : arrêt définitif, sans nouvel essai
-  automatique, jusqu'au bouton de test ou d'autres identifiants.
+- **Identifiants refusés ou droits manquants** (tout refus du point de jeton
+  hors 429/5xx) : arrêt définitif gardé dans `/data`, **sans nouvel essai
+  automatique**. Il est levé par l'enregistrement d'autres identifiants, ou
+  par un succès du bouton **Tester la connexion** (qui réessaie une fois).
 - **HTTP 429 ou 5xx** : pause de 1 min à 6 h gardée dans `/data` (le
-  verrouillage a encore droit à un essai).
-- Autres erreurs : nouvel essai dans 1, 2, 5 puis 15 min, jamais plus vite que
-  l'intervalle. Le bouton de test, la Découverte, une reconnexion à Gladys ou
-  un redémarrage ne relisent jamais plus vite que l'intervalle.
+  verrouillage a encore droit à un essai). Un 5xx sur l'état d'une tâche
+  saute seulement cette lecture.
+- Autres erreurs : nouvel essai à l'intervalle (5 min au moins). Le bouton de
+  test (sauf lu il y a moins d'un intervalle), la Découverte, une reconnexion
+  à Gladys ou un redémarrage ne relisent jamais plus vite que l'intervalle.
+- Après un redémarrage, la dernière lecture réussie gardée dans `/data`
+  donne aussitôt le statut, l'onglet Découverte et les badges, jusqu'à la
+  lecture suivante (ses valeurs ne sont pas republiées comme neuves).
 
 ## Ce qui est gardé dans `/data`
 
 Le fichier `igloohome-state.json` (lisible seulement par l'utilisateur du
 conteneur) garde : les pauses, les arrêts (avec l'empreinte salée des
-identifiants **refusés**, jamais des bons), l'heure de la dernière lecture,
-les identifiants igloohome des serrures et de leurs bridges, les gardes de
-déverrouillage. Jamais le secret ni le jeton.
+identifiants **refusés**, jamais des bons), l'heure de la dernière lecture et
+de la dernière réussite, un résumé borné de la liste des appareils (noms,
+types, batterie, synchro, bridge), les identifiants igloohome des serrures et
+de leurs bridges, les tâches suivies et les gardes de déverrouillage (écrites
+aussitôt après l'envoi). Jamais le secret ni le jeton.
 
 ## Limites connues
 
@@ -110,8 +127,8 @@ déverrouillage. Jamais le secret ni le jeton.
   bridge), pas de journal des accès ni de code PIN dans cette version.
 - Seule la première page de la liste des appareils est lue (un message le dit
   si igloohome en donne d'autres).
-- La signification exacte de « tâche terminée » (réussie ou seulement finie)
-  reste à vérifier sur un vrai compte.
+- Le sens exact d'une tâche « traitée » (réussie ou seulement finie) et sa
+  durée de vie restent à vérifier sur un vrai compte.
 
 ## Crédits
 

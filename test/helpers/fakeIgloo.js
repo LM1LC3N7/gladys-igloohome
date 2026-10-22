@@ -104,6 +104,21 @@ export function fakeIgloo({ clock = fakeClock() } = {}) {
     onSent: undefined,
     /** A promise per kind: the answer waits for it. */
     gate: {},
+    /** The scopes the API client was given (a scope asked outside: invalid_scope). */
+    granted: new Set([
+      'igloohomeapi/get-devices',
+      'igloohomeapi/lock-bridge-proxied-job',
+      'igloohomeapi/unlock-bridge-proxied-job',
+      'igloohomeapi/get-job-status',
+    ]),
+    /** An HTTP status of the token endpoint with this body instead (403 without code...). */
+    tokenStatus: undefined,
+    /** ms of life of a new job (its expiryDate). */
+    jobLife: 120_000,
+    /** The jobResponse of the status. */
+    jobResponse: {},
+    /** The status answers about another job id (a mix-up). */
+    wrongJobId: false,
     issued: new Set(),
   };
   let tokens = 0;
@@ -163,11 +178,17 @@ export function fakeIgloo({ clock = fakeClock() } = {}) {
     if (kind === 'token') {
       const expected = `Basic ${Buffer.from(`${cloud.clientId}:${cloud.clientSecret}`).toString('base64')}`;
       call.scope = new URLSearchParams(body).get('scope');
+      if (cloud.tokenStatus) {
+        return json(cloud.tokenStatus, cloud.tokenBody ?? '');
+      }
       if (cloud.tokenError) {
         return json(400, { error: cloud.tokenError });
       }
       if (headers.authorization !== expected) {
         return json(400, { error: 'invalid_client' });
+      }
+      if (call.scope.split(' ').some((s) => !cloud.granted.has(s))) {
+        return json(400, { error: 'invalid_scope' });
       }
       tokens += 1;
       const token = `token-${tokens}`;
@@ -195,7 +216,7 @@ export function fakeIgloo({ clock = fakeClock() } = {}) {
         device,
         bridge,
         completed: cloud.completeAtOnce,
-        expiry: new Date(clock.now() + 120_000).toISOString(),
+        expiry: new Date(clock.now() + cloud.jobLife).toISOString(),
       });
       return json(200, { jobId });
     }
@@ -205,12 +226,13 @@ export function fakeIgloo({ clock = fakeClock() } = {}) {
       if (!job) {
         return json(404, { message: 'not found' });
       }
+      call.jobId = jobId;
       return json(200, {
-        jobId,
+        jobId: cloud.wrongJobId ? 'job-other' : jobId,
         expiryDate: job.expiry,
-        completed: job.completed,
+        completed: cloud.wrongJobId ? true : job.completed,
         jobType: String(job.type),
-        jobResponse: {},
+        jobResponse: cloud.jobResponse,
       });
     }
     return json(404, {});

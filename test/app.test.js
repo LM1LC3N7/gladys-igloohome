@@ -1,21 +1,15 @@
 // -----------------------------------------------------------------------------
-// IglooApp with the SDK's fake Gladys, the exact handlers of the container
-// (src/handlers.js), a fake igloohome cloud behind the client's `request`, a
-// fake clock and a memory store. No network; the timers are recorded, never
-// fired by themselves.
+// IglooApp end to end against the fake Gladys and the fake igloohome cloud
+// (test/helpers/setup.js): Discovery, states, commands and their safety
+// rules, stops, pauses, reads never sooner than the interval.
 // -----------------------------------------------------------------------------
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createFakeGladys } from '@gladysassistant/integration-sdk/testing';
-import { IglooApp } from '../src/app.js';
-import { IglooClient } from '../src/client.js';
 import { TIMINGS } from '../src/constants.js';
-import { registerHandlers } from '../src/handlers.js';
 import { memoryStore } from '../src/store.js';
 import {
   BRIDGE,
-  CLIENT_ID,
   CLIENT_SECRET,
   KEYPAD,
   LOCK,
@@ -23,88 +17,7 @@ import {
   fakeClock,
   fakeIgloo,
 } from './helpers/fakeIgloo.js';
-
-const SELECTOR = 'igloohome';
-const id = (device, key) => `ext:${SELECTOR}:igloohome:${device}${key ? `:${key}` : ''}`;
-const BASE = { client_id: CLIENT_ID, client_secret: CLIENT_SECRET };
-
-async function setup(
-  t,
-  {
-    config = {},
-    clock = fakeClock(),
-    cloud = fakeIgloo({ clock }),
-    store = memoryStore(),
-    devices = [],
-    read = true,
-  } = {},
-) {
-  const gladys = createFakeGladys({ selector: SELECTOR, config: { ...BASE, ...config }, devices });
-  const logs = [];
-  const logger = Object.fromEntries(
-    ['debug', 'info', 'warn', 'error'].map((level) => [
-      level,
-      (...args) => logs.push(`${level} ${args.map((a) => a?.message ?? a).join(' ')}`),
-    ]),
-  );
-  const timeouts = [];
-  const timers = {
-    setTimeout: (fn, ms) => {
-      timeouts.push({ fn, ms, at: clock.now() });
-      return timeouts.length;
-    },
-    clearTimeout: () => {},
-    setInterval: () => 1,
-    clearInterval: () => {},
-  };
-  const app = new IglooApp({
-    gladys,
-    logger,
-    client: new IglooClient({ request: cloud.request, now: clock.now }),
-    store,
-    now: clock.now,
-    timers,
-  });
-  registerHandlers(gladys, app, logger);
-  await gladys.connect();
-  if (read) {
-    await app.tick({ scheduled: true });
-  }
-  t.after(() => app.stop());
-  return { gladys, app, cloud, logs, store, clock, timeouts };
-}
-
-async function createAll(gladys) {
-  for (const device of gladys.fake.discoveredDevices) {
-    await gladys.fake.deviceCreated(device);
-  }
-}
-
-const deviceOf = (gladys, device) =>
-  gladys.fake.devices.find((d) => d.external_id === id(device)) ??
-  gladys.fake.discoveredDevices.find((d) => d.external_id === id(device));
-const featureOf = (device, key) => device.features.find((f) => f.external_id.endsWith(`:${key}`));
-
-async function press(gladys, device, key, value = 1) {
-  const d = deviceOf(gladys, device);
-  return gladys.fake.setValue(d, featureOf(d, key), value);
-}
-
-const status = (gladys) => gladys.fake.connectionStatus;
-
-/** Runs the recorded timers whose delay is one of `delays` (job status reads). */
-async function fireJobReads(timeouts, clock, app) {
-  for (const delay of TIMINGS.jobFollowUps) {
-    const entry = timeouts.find((e) => e.ms === delay && !e.fired);
-    if (entry) {
-      entry.fired = true;
-      clock.advance(delay);
-      entry.fn();
-      await new Promise((resolve) => setImmediate(resolve));
-      await app.publisher.flush();
-    }
-  }
-}
+import { BASE, createAll, deviceOf, id, lastText, press, setup, status } from './helpers/setup.js';
 
 test('the devices of the account become the devices of the Discovery tab (bridges left out)', async (t) => {
   const { gladys, cloud } = await setup(t);
@@ -129,11 +42,16 @@ test('the devices of the account become the devices of the Discovery tab (bridge
   assert.equal(status(gladys).connected, true);
   assert.match(status(gladys).message.fr, /3 appareil\(s\), 1 serrure\(s\)/);
   assert.match(status(gladys).message.fr, /Déverrouillage désactivé/);
-  // Only the scopes the integration needs.
+  // Only the scopes the integration needs; the unlock one only when allowed.
   assert.equal(
     cloud.of('token')[0].scope,
-    'igloohomeapi/get-devices igloohomeapi/lock-bridge-proxied-job igloohomeapi/unlock-bridge-proxied-job igloohomeapi/get-job-status',
+    'igloohomeapi/get-devices igloohomeapi/lock-bridge-proxied-job igloohomeapi/get-job-status',
   );
+});
+
+test('with unlocking allowed, the token asks the unlock scope too', async (t) => {
+  const { cloud } = await setup(t, { config: { allow_unlock: true } });
+  assert.match(cloud.of('token')[0].scope, /igloohomeapi\/unlock-bridge-proxied-job/);
 });
 
 test('states and badges: only for the created devices', async (t) => {
@@ -172,10 +90,9 @@ test('a value other than 1 is refused; a read-only feature too', async (t) => {
   assert.equal(cloud.calls.length, calls);
 });
 
-test('unlock once allowed: a fresh read, one job through the bridge, "sent, without confirmation", a guard, then the job status', async (t) => {
-  const { gladys, app, cloud, clock, timeouts, store } = await setup(t, {
-    config: { allow_unlock: true },
-  });
+test('unlock once allowed: a fresh read, one job, "sent, without confirmation", a guard, then "processed (result not read)"', async (t) => {
+  const env = await setup(t, { config: { allow_unlock: true } });
+  const { gladys, cloud, store } = env;
   await createAll(gladys);
   const reads = cloud.of('devices').length;
   const ack = await press(gladys, LOCK, 'unlock');
@@ -185,40 +102,22 @@ test('unlock once allowed: a fresh read, one job through the bridge, "sent, with
   const [job] = cloud.of('job');
   assert.deepEqual([job.jobType, job.device, job.bridge], [2, LOCK, BRIDGE]);
   assert.equal(store.data.guards.length, 1, 'the guard is kept in /data');
-  await app.publisher.flush();
-  assert.match(gladys.fake.lastState(id(LOCK, 'last_command')), /en attente/);
+  assert.equal(store.data.jobs.length, 1, 'the job watched is kept in /data');
+  await env.app.publisher.flush();
+  assert.match(lastText(gladys, LOCK), /accepté par igloohome, en attente du bridge/);
 
   // A second unlock while the first may still run: refused, nothing sent.
-  clock.advance(TIMINGS.bridgeSpacing);
+  await env.advance(TIMINGS.bridgeSpacing);
   const again = await press(gladys, LOCK, 'unlock');
   assert.match(again.error, /attend encore son bridge/);
   assert.equal(cloud.of('job').length, 1);
 
-  // The bridge runs it: the status read back ends the guard.
+  // The bridge processes it: never "done", the guard lifted.
   cloud.jobs.get(job.jobId).completed = true;
-  await fireJobReads(timeouts, clock, app);
-  assert.match(gladys.fake.lastState(id(LOCK, 'last_command')), /tâche terminée/);
+  await env.advance(60_000);
+  assert.match(lastText(gladys, LOCK), /traitée par le bridge \(résultat non lu/);
   assert.equal(store.data.guards.length, 0);
-});
-
-test('a job completed at once is confirmed in the ack', async (t) => {
-  const { gladys, cloud } = await setup(t, { config: { allow_unlock: true } });
-  cloud.completeAtOnce = true;
-  await createAll(gladys);
-  const ack = await press(gladys, LOCK, 'unlock');
-  assert.equal(ack.success, true, ack.error);
-  assert.equal(cloud.of('status').length, 1);
-});
-
-test('a job never completed: "not confirmed" when it expires, the guard lifted', async (t) => {
-  const { gladys, app, clock, timeouts, store } = await setup(t, {
-    config: { allow_unlock: true },
-  });
-  await createAll(gladys);
-  await press(gladys, LOCK, 'unlock');
-  await fireJobReads(timeouts, clock, app);
-  assert.match(gladys.fake.lastState(id(LOCK, 'last_command')), /non confirmé, la tâche a expiré/);
-  assert.equal(store.data.guards.length, 0);
+  assert.equal(store.data.jobs.length, 0);
 });
 
 test('unlock: the option turned off during the read stops it before sending', async (t) => {
@@ -274,7 +173,8 @@ test('unlock: a lock no longer linked or listed is refused after the fresh read'
 });
 
 test('lock: no read, never blocked by a 429 pause (one try), never behind an unlock', async (t) => {
-  const { gladys, app, cloud, clock } = await setup(t, { config: { allow_unlock: true } });
+  const env = await setup(t, { config: { allow_unlock: true } });
+  const { gladys, app, cloud, clock } = env;
   await createAll(gladys);
   cloud.httpStatus.devices = 429;
   cloud.headers = { 'retry-after': '600' };
@@ -294,7 +194,6 @@ test('lock: no read, never blocked by a 429 pause (one try), never behind an unl
 test('lock cancels an unlock waiting in the queue of that lock', async (t) => {
   const { gladys, cloud } = await setup(t, { config: { allow_unlock: true } });
   await createAll(gladys);
-  // The unlock's fresh read is held; a second unlock waits behind it; a lock arrives.
   let release;
   cloud.gate.devices = new Promise((resolve) => {
     release = resolve;
@@ -329,9 +228,8 @@ test('lock works after a restart before the first read (the bridge kept in /data
   clock.advance(10_000);
   const second = await setup(t, { clock, cloud, store, devices: created, read: false });
   const reads = cloud.of('devices').length;
-  // Restarted within the interval: no read.
   await second.app.tick();
-  assert.equal(cloud.of('devices').length, reads);
+  assert.equal(cloud.of('devices').length, reads, 'restarted within the interval: no read');
   const ack = await press(second.gladys, LOCK, 'lock');
   assert.match(ack.error, /envoyée, sans confirmation/);
   assert.equal(cloud.of('job').at(-1).bridge, BRIDGE);
@@ -358,42 +256,6 @@ test('the guard of an unlock survives a restart', async (t) => {
   const ack = await press(second.gladys, LOCK, 'unlock');
   assert.match(ack.error, /attend encore son bridge/);
   assert.equal(cloud.of('job').length, 1);
-});
-
-test('refused credentials: a stop kept in /data, spaced tries, lifted by other credentials only', async (t) => {
-  const clock = fakeClock();
-  const store = memoryStore();
-  const cloud = fakeIgloo({ clock });
-  cloud.clientSecret = 'another';
-  const { gladys, app, timeouts } = await setup(t, { clock, cloud, store });
-  assert.equal(status(gladys).connected, false);
-  assert.match(status(gladys).message.fr, /refusé l'identifiant ou le secret client/);
-  assert.equal(store.data.block.kind, 'refused');
-  assert.ok(!JSON.stringify(store.data).includes(CLIENT_SECRET), 'no secret in /data');
-  const next = timeouts.at(-1);
-  assert.ok(next.ms >= TIMINGS.authRetries[0] - 1000, 'next try in 1 h');
-  // The test button tries once; still refused: the stop stays.
-  clock.advance(TIMINGS.authRetries[0] / 2);
-  const answer = await app.testConnection();
-  assert.match(answer.fr, /l'arrêt reste/);
-  assert.equal(store.data.block.failures, 2);
-  // Other credentials lift it.
-  cloud.clientSecret = 'new-secret';
-  await gladys.fake.configUpdated({ ...BASE, client_secret: 'new-secret' });
-  // The read at once of new credentials (the timer set by the start).
-  assert.equal(timeouts.at(-1).ms, 0);
-  await app.tick({ scheduled: true });
-  assert.equal(store.data.block, null);
-  assert.equal(status(gladys).connected, true);
-});
-
-test('a missing scope is a final stop: no automatic try', async (t) => {
-  const cloud = fakeIgloo();
-  cloud.tokenError = 'invalid_scope';
-  const { gladys, app, store } = await setup(t, { cloud });
-  assert.equal(store.data.block.kind, 'scope');
-  assert.match(status(gladys).message.fr, /pas de nouvel essai automatique/i);
-  assert.equal(app.timer, undefined);
 });
 
 test('429 on the read: a pause kept in /data, never read sooner', async (t) => {

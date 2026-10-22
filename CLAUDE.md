@@ -53,20 +53,25 @@ through a 429/5xx pause or a stop, possible before the first read after a
 restart (bridges in /data), and it cancels every unlock of the lock not sent
 yet. Unlocking (`allow_unlock`) stays off by default; it is checked on
 arrival, after the fresh read of the device list and in `beforeSend`; one at a
-time per lock; refused while the guard of the previous unlock holds (until its
-job ends, 2.5 min at most, kept in /data, set before the first byte), within
-30 s of another job on the same bridge, when the token would need a renewal,
-during a pause or a stop, or past 3.5 s. A job accepted is "sent, without
-confirmation" until its status reads completed. Never weaken these rules.
-Never a `switch` or a commandable `binary` for a lock.
+time per lock; refused while an unlock job of the lock is watched or its
+guard holds (set before the first byte, kept in /data, 15.5 min at most),
+within 30 s of another job on the same bridge (before the read, after it and
+in `beforeSend`), when the token would need a renewal or lacks the unlock
+scope, during a pause or a stop, or past 3.5 s. A command is never acked
+done: a job accepted is "sent, without confirmation"; every job is watched to
+its own end ("processed, result not read", "expired" only from a read after
+its expiry date, else "result unknown" at 15 min), and an unlock processed
+after a later lock raises an alert. Never weaken these rules. Never a
+`switch` or a commandable `binary` for a lock.
 
 ## Account rules
 
 - The client secret and the token are never logged, published, put in an
   error or written to /data; only the salted fingerprint of a REFUSED pair.
-- Refused credentials: a stop with spaced tries (1 h, 6 h, 24 h); a missing
-  scope: a final stop. The test button tries once and lifts a stop only on a
-  success. 429/5xx: a pause (1 min to 6 h) in /data.
+- Any refusal of the token endpoint but 429/5xx: a final stop (credentials
+  refused or rights missing), no automatic try, lifted by other credentials
+  or a success of the test button. The unlock scope is asked only while
+  `allow_unlock` is on. 429/5xx: a pause (1 min to 6 h) in /data.
 - Reads are never sooner than the interval (the time is written to /data
   before the read). A reconnection to Gladys resends status, Discovery and
   badges, and clears no pause nor stop.

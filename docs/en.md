@@ -21,8 +21,9 @@ And for a **lock linked to a bridge**:
 
 - a **Lock** button (always allowed);
 - an **Unlock** button (off by default, see below);
-- **Last command**: the result of the last command, read back from igloohome
-  ("job completed by the bridge", "not confirmed, the job expired"…).
+- **Last command**: what igloohome says of the job of the last command
+  ("accepted, waiting for the bridge", "job processed by the bridge (result
+  not read)", "igloohome says the job expired", "result unknown"…).
 
 igloohome **gives no locked/unlocked state** for a lock: the integration does
 not invent one (Home Assistant shows an assumed state).
@@ -34,10 +35,12 @@ not invent one (Home Assistant shows an assumed state).
    only).
 2. An **API client** created in the **iglooaccess** portal (an offer mostly
    aimed at businesses): it gives a _client id_ and a _client secret_. The
-   client needs the scopes `get-devices`, `lock-bridge-proxied-job`,
-   `unlock-bridge-proxied-job` and `get-job-status`. **igloohome may bill the
-   use of the API** (for instance per active device and per month): check the
-   terms of your offer.
+   client needs the scopes `get-devices`, `lock-bridge-proxied-job` and
+   `get-job-status`. The `unlock-bridge-proxied-job` right is needed only if
+   you allow unlocking; without it, igloohome itself refuses every unlock
+   (the rest works, the status says so). **igloohome may bill the use of the
+   API** (for instance per active device and per month): check the terms of
+   your offer.
 
 ## Configuration
 
@@ -46,7 +49,9 @@ not invent one (Home Assistant shows an assumed state).
   (`auth.igloohome.co`) to get an access token. The token stays in the memory
   of the container, never written to disk.
 - **Allow unlocking the locks from Gladys**: off by default. On, a scene, a
-  dashboard or a voice assistant connected to Gladys can open your door.
+  dashboard or a voice assistant connected to Gladys can open your door. The
+  token carries the unlock right only while the option is on (a new token is
+  asked when you change it).
 - **Refresh interval**: 900 s (15 min) by default, from 300 s to 86,400 s.
   One request per read for the whole account.
 - **Language of the feature names**.
@@ -56,45 +61,55 @@ Save, then add the devices from the **Discovery** tab.
 ## The commands and their safety
 
 igloohome commands a lock **through its bridge**, as a "job" the bridge runs
-within 2 minutes (it takes about 2 a minute).
+later (it takes about 2 a minute). **A job igloohome has accepted cannot be
+cancelled**, and the order in which the bridge runs the jobs is not
+guaranteed.
 
 - **Unlock** is refused while the option is off; the option is checked again
   on arrival, after the read and right before sending. Before acting, the
   device list is **read again from igloohome**: the lock must still be in it,
   as a lock, linked to a bridge. One unlock at a time per lock; none while the
-  previous one may still be waiting for its bridge (2 min 30, kept across a
-  restart); none within 30 s of another job on the same bridge.
+  job of the previous one is watched (until its end, 15 min at most, kept
+  across a restart); none within 30 s of another job on the same bridge.
 - **Lock** is never blocked: no read before, no queue, one try even during a
-  pause asked by igloohome, and possible right after a restart (the bridge of
-  each lock is kept in `/data`). It cancels at once every unlock of that lock
-  not sent yet.
+  pause asked by igloohome or a stop, and possible right after a restart (the
+  bridge of each lock is kept in `/data`). It cancels at once every unlock of
+  that lock not sent yet.
 - A command leaves within 3.5 s of your click, or is refused without sending
-  anything. A job accepted by igloohome is answered "Command sent, without
-  confirmation": the confirmation then comes from the status of the job, read
-  a few times over 2 min 20, and shows in **Last command**. When the job is
-  already completed at the answer, the command is confirmed at once.
+  anything. It is **never answered done**: a job accepted by igloohome is
+  "Command sent, without confirmation". Its status is then read (5, 15, 30,
+  60, 100, 140 s, then every minute) until igloohome says it was processed,
+  or expired by a read made after its expiry date, or 15 min at most (then
+  "result unknown: check the lock"). What igloohome says of the result of a
+  processed job is not read yet (unknown form): check the lock.
+- When an unlock sent **before** a lock is processed after it, **Last
+  command** says so: press Lock again (never resent by itself).
 - The buttons are never switches: a "turn everything off" of a voice assistant
   or a scene cannot reach them.
 
 ## Errors and rate limits
 
-- **Credentials refused**: a stop kept in `/data`, a new try in 1 h, 6 h, then
-  every 24 h; at once with other credentials; the **Test the connection**
-  button tries once and lifts the stop only on a success.
-- **Missing scopes**: a final stop, no automatic new try, until the test
-  button or other credentials.
+- **Credentials refused or rights missing** (any refusal of the token
+  endpoint but 429/5xx): a final stop kept in `/data`, **no automatic new
+  try**. Saving other credentials lifts it, or a success of the **Test the
+  connection** button (which tries once).
 - **HTTP 429 or 5xx**: a pause of 1 min to 6 h kept in `/data` (locking still
-  gets one try).
-- Other errors: a new try in 1, 2, 5, then 15 min, never sooner than the
-  interval. The test button, the Discovery tab, a reconnection to Gladys or a
-  restart never read sooner than the interval.
+  gets one try). A 5xx on the status of a job only skips that read.
+- Other errors: a new try at the interval (5 min at least). The test button
+  (unless read less than an interval ago), the Discovery tab, a reconnection
+  to Gladys or a restart never read sooner than the interval.
+- After a restart, the last successful read kept in `/data` gives the status,
+  the Discovery tab and the badges at once, until the next read (its values
+  are not republished as new).
 
 ## What is kept in `/data`
 
 The file `igloohome-state.json` (readable by the container user only) keeps:
 the pauses, the stops (with the salted fingerprint of **refused** credentials,
-never of good ones), the time of the last read, the igloohome ids of the locks
-and their bridges, the unlock guards. Never the secret nor the token.
+never of good ones), the time of the last read and of the last success, a
+bounded summary of the device list (names, types, battery, sync, bridge), the
+igloohome ids of the locks and their bridges, the jobs watched and the unlock
+guards (written right after sending). Never the secret nor the token.
 
 ## Known limits
 
@@ -102,8 +117,8 @@ and their bridges, the unlock guards. Never the secret nor the token.
   access log nor PIN code in this version.
 - Only the first page of the device list is read (a message says so when
   igloohome gives more).
-- The exact meaning of "job completed" (succeeded, or only ended) is still to
-  be checked on a real account.
+- The exact meaning of a "processed" job (succeeded, or only ended) and its
+  life are still to be checked on a real account.
 
 ## Credits
 

@@ -6,45 +6,60 @@
 // bridge (lock, unlock). index.js only wires the SDK handlers to it.
 //
 // igloohome commands a lock only through its bridge, as a "job" the bridge
-// runs within 2 minutes; it gives no locked/unlocked state. So:
+// runs later; it gives no locked/unlocked state, and what a "completed" job
+// means (succeeded, or only processed) is not known yet. So:
 //   - a lock is never a switch: two buttons, and a read-only text of the last
-//     command and its result (the job status read back);
-//   - unlocking is refused unless "Allow unlocking" is on, checked on
-//     arrival, after the fresh read and right before the request leaves
-//     (beforeSend); it is decided on the device list read just now (the lock
-//     still listed as a lock of the account, linked to a bridge), never on
-//     memory; one unlock at a time per lock, none while the previous one may
-//     still be waiting for its bridge (a guard of 2.5 min kept in /data,
-//     lifted when its job ends), none within 30 s of another job on the same
-//     bridge (2 jobs a minute);
+//     command and what igloohome says of its job;
+//   - a command is never answered "done": a job accepted is "sent, without
+//     confirmation"; every job is watched until igloohome says it was
+//     processed, or a read made after its expiry date says it was not, or
+//     15 min (then "result unknown"); an unlock processed after a later lock
+//     raises an alert in the last-command text;
+//   - unlocking is refused unless "Allow unlocking" is on (and only then is
+//     its scope asked), checked on arrival, after the fresh read and right
+//     before the request leaves (beforeSend); it is decided on the device
+//     list read just now (the lock still listed as a lock of the account,
+//     linked to a bridge), never on memory; one unlock at a time per lock,
+//     none while an unlock job of that lock is watched (a guard kept in
+//     /data), none within 30 s of another job on the same bridge (checked
+//     before the read and again in beforeSend);
 //   - locking (protective) never waits behind the unlocks (no queue, no
 //     read), goes through a 429/5xx pause or a stop (one try), works before
 //     the first read after a restart (the bridge of each lock is kept in
 //     /data), and cancels at once every unlock of that lock not sent yet,
-//     even when it is refused itself;
+//     even when it is refused itself (a job igloohome accepted cannot be
+//     cancelled);
 //   - sent within 3.5 s of the click or refused unsent; answered by 4.3 s; a
-//     job accepted by igloohome is "sent, without confirmation" until its
-//     status reads completed; a request that may have reached igloohome is
-//     never answered "not sent"; never retried;
+//     request that may have reached igloohome is never answered "not sent";
+//     never retried;
 //   - the ack never waits for a publication to Gladys.
 //
 // Reads: never sooner than the interval (the test button, a scan, a
 // reconnection, a configuration saved unchanged, a restart: the time of the
 // last read is written to /data before it); one read at a time; a read or an
 // answer of older credentials publishes nothing (generation checked after
-// every await).
-// Failures: credentials refused -> a stop persisted (1 h, 6 h, then 24 h;
-// other credentials lift it at once; the test button tries once, and lifts it
-// only on a success); a scope missing -> a final stop (no automatic try);
-// 429/5xx -> a pause of 1 min to 6 h persisted; anything else -> 1, 2, 5,
-// 15 min, never sooner than the interval. A reconnection to Gladys clears
-// none of them.
+// every await). After a restart, the last successful read kept in /data
+// gives the status, the Discovery tab and the badges until the next read
+// (its values are never republished as new).
+// Failures: any refusal of the token endpoint but 429/5xx -> a final stop
+// persisted (credentials refused, or a scope missing; lifted by other
+// credentials or a success of the test button, never by itself); 429/5xx ->
+// a pause of 1 min to 6 h persisted; anything else -> a new try never sooner
+// than the interval. A reconnection to Gladys clears none of them.
 // -----------------------------------------------------------------------------
 
 import { DEVICE_TRANSPORTS, createLogger } from '@gladysassistant/integration-sdk';
 import { IglooClient } from './client.js';
 import { accountKey, credentialsKey, normalizeConfig } from './config.js';
-import { COMMAND_KEYS, DEVICE_TYPES, FEATURES, JOB_TYPES, SECOND, TIMINGS } from './constants.js';
+import {
+  COMMAND_KEYS,
+  DEVICE_TYPES,
+  FEATURES,
+  GUARD_MAX,
+  JOB_TYPES,
+  SECOND,
+  TIMINGS,
+} from './constants.js';
 import { buildDevice, deviceIds, featuresOf, parseExternalId, valuesOf } from './devices.js';
 import { reasonOf } from './http.js';
 import { ERRORS, LAST, T, age, join, word } from './i18n.js';
@@ -110,12 +125,14 @@ export class IglooApp {
     this.guards = new Map();
     /** bridge -> when its last job left. */
     this.bridgeJobs = new Map();
+    /** jobId -> { id, lock, action, sentAt, expiry?, reads, timer? }: the jobs watched. */
+    this.jobs = new Map();
     /** lock -> the jobId of its latest command (only it writes the last-command text). */
     this.latestJob = new Map();
+    /** lock -> when its last lock job left (an unlock processed before it raises an alert). */
+    this.lastLockSentAt = new Map();
     /** lock -> { en, fr }: the last-command text. */
     this.lastTexts = new Map();
-    /** Timers of the job status reads. */
-    this.jobTimers = new Set();
   }
 
   resetRead() {
@@ -123,6 +140,8 @@ export class IglooApp {
     this.devices = undefined;
     this.more = false;
     this.readAt = undefined;
+    /** The device list comes from /data (before a restart): its values are not republished. */
+    this.stale = false;
     /** undefined: not read since the start; true: answered; false: failing. */
     this.online = undefined;
     this.failures = 0;
@@ -136,6 +155,17 @@ export class IglooApp {
   async start(raw = {}) {
     this.stop();
     const generation = this.generation;
+    const previousKey = this.credKey;
+    this.config = normalizeConfig(raw);
+    this.credKey = credentialsKey(this.config);
+    // Before any await: a command arriving meanwhile meets the new client
+    // (no token yet) and none of the old account's bridges.
+    this.client.configure(this.config.auth, { unlock: this.config.allowUnlock });
+    if (previousKey !== this.credKey) {
+      this.bridges = new Map();
+      this.latestJob.clear();
+      this.lastTexts.clear();
+    }
     if (!this.memory) {
       this.memory = normalizeMemory(await this.store.load().catch(() => null), this.now());
       // Written at most once a minute: the real last read may be up to a
@@ -150,19 +180,13 @@ export class IglooApp {
     if (generation !== this.generation) {
       return;
     }
-    const previousKey = this.credKey;
-    this.config = normalizeConfig(raw);
-    this.credKey = credentialsKey(this.config);
-    await this.adoptAccount();
+    const otherAccount = await this.adoptAccount();
     if (generation !== this.generation) {
       return;
     }
-    this.client.configure(this.config.auth);
-    if (previousKey !== this.credKey) {
-      // The jobs of other credentials are not watched by these ones.
-      this.latestJob.clear();
-      this.lastTexts.clear();
-    }
+    // A new generation once settled: a command or an answer begun during the
+    // awaits above belongs to the previous one.
+    this.generation += 1;
     this.resetRead();
     this.restore();
     this.published = undefined;
@@ -173,27 +197,37 @@ export class IglooApp {
       await this.publishAll();
       return;
     }
-    await this.updateStatus();
-    // New credentials: read at once (a pause or a block still holds).
-    // Otherwise never sooner than the interval.
-    const changed = previousKey !== undefined && previousKey !== this.credKey;
+    for (const job of this.jobs.values()) {
+      this.scheduleJobRead(job);
+    }
+    await this.publishAll();
+    // New credentials or another account: read at once (a pause or a block
+    // still holds). Otherwise never sooner than the interval.
+    const changed = otherAccount || (previousKey !== undefined && previousKey !== this.credKey);
     this.schedule(changed ? Math.max(0, this.holdUntil() - this.now()) : undefined);
   }
 
+  /** Stops the timers; resolves once /data is written (a shutdown waits for it). */
   stop() {
     this.generation += 1;
     this.clearTimer();
     this.clearRenewTimer();
-    for (const handle of this.jobTimers) {
-      this.timers.clearTimeout(handle);
+    for (const job of this.jobs.values()) {
+      if (job.timer) {
+        this.timers.clearTimeout(job.timer);
+        job.timer = undefined;
+      }
     }
-    this.jobTimers.clear();
     this.publisher.stop();
-    if (this.memory && this.lastAttemptAt > this.memory.lastAttemptAt) {
-      this.memory.lastAttemptAt = this.lastAttemptAt;
-      return this.saveMemory();
+    if (!this.memory) {
+      return Promise.resolve();
     }
-    return Promise.resolve();
+    let save = Promise.resolve();
+    if (this.lastAttemptAt > this.memory.lastAttemptAt) {
+      this.memory.lastAttemptAt = this.lastAttemptAt;
+      save = this.saveMemory();
+    }
+    return save.then(() => this.store.flush?.()).catch(() => {});
   }
 
   clearTimer() {
@@ -211,11 +245,13 @@ export class IglooApp {
   }
 
   /**
-   * /data belongs to one client id: another one drops its locks, guards and
-   * bridge jobs. Other credentials than the refused ones lift the block.
+   * /data belongs to one client id: another one drops its locks, guards,
+   * jobs and summary (returns true then). Other credentials than the refused
+   * ones lift the block.
    */
   async adoptAccount() {
     let changed = false;
+    let other = false;
     const account = accountKey(this.config);
     if (account) {
       const fp = fingerprintOf(this.memory.salt, account);
@@ -223,8 +259,12 @@ export class IglooApp {
         this.memory.account = fp;
         this.memory.locks = [];
         this.memory.guards = [];
+        this.memory.jobs = [];
         this.memory.bridgeJobs = [];
+        this.memory.summary = null;
+        this.memory.okAt = 0;
         changed = true;
+        other = true;
       }
     }
     const block = this.memory.block;
@@ -235,10 +275,12 @@ export class IglooApp {
     if (changed) {
       await this.saveMemory();
     }
+    return other;
   }
 
-  /** The bridges, guards and bridge jobs kept in /data. */
+  /** The bridges, guards, jobs, bridge jobs and last device list kept in /data. */
   restore() {
+    const now = this.now();
     this.bridges = new Map(this.memory.locks.map((l) => [l.id, l.bridge]));
     this.guards = new Map(
       this.memory.guards.map((g) => [
@@ -247,6 +289,23 @@ export class IglooApp {
       ]),
     );
     this.bridgeJobs = new Map(this.memory.bridgeJobs.map((j) => [j.bridge, j.at]));
+    this.jobs = new Map();
+    for (const job of this.memory.jobs) {
+      const reads = TIMINGS.jobFollowUps.filter((d) => job.sentAt + d <= now).length;
+      this.jobs.set(job.id, { ...job, reads });
+      const latest = this.jobs.get(this.latestJob.get(job.lock));
+      if (!latest || latest.sentAt <= job.sentAt) {
+        this.latestJob.set(job.lock, job.id);
+      }
+    }
+    const summary = this.memory.summary;
+    if (this.config.auth && summary && this.memory.okAt > 0) {
+      this.devices = new Map(summary.devices.map((d) => [d.id, d]));
+      this.more = summary.more;
+      this.readAt = this.memory.okAt;
+      this.online = true;
+      this.stale = true;
+    }
   }
 
   /**
@@ -283,6 +342,11 @@ export class IglooApp {
     this.config = next;
     if (previous.allowUnlock !== next.allowUnlock) {
       this.logger.info(`Unlocking ${next.allowUnlock ? 'allowed' : 'disabled'}`);
+      // Other scopes: the token goes; the next one is asked now (in the background).
+      this.client.setUnlock(next.allowUnlock);
+      if (next.auth && !this.blocked && !this.paused && this.hasCreatedLock()) {
+        this.renew();
+      }
     }
     if (previous.pollInterval !== next.pollInterval && this.timer && !this.running) {
       this.schedule();
@@ -313,19 +377,17 @@ export class IglooApp {
     return Boolean(this.memory?.pause) && this.now() < this.memory.pause.until;
   }
 
-  /** Credentials refused (until the next spaced try) or a scope missing (final). */
+  /** Credentials refused or a scope missing: final until other credentials or a test success. */
   get blocked() {
-    const block = this.memory?.block;
-    if (!block) {
-      return false;
-    }
-    return block.kind === 'scope' || this.now() < block.until;
+    return Boolean(this.memory?.block);
   }
 
-  /** The end of a pause or a block, or now (a final block: far away). */
+  /** The end of a pause, or now; a block: never (Infinity). */
   holdUntil() {
-    const block = this.blocked ? (this.memory.block.until ?? Infinity) : 0;
-    return Math.max(this.now(), this.paused ? this.memory.pause.until : 0, block);
+    if (this.blocked) {
+      return Infinity;
+    }
+    return Math.max(this.now(), this.paused ? this.memory.pause.until : 0);
   }
 
   /** The earliest periodic read: the interval after the last one, a pause, a block. */
@@ -343,22 +405,20 @@ export class IglooApp {
     this.logger.warn(`igloohome: ${reasonOf(err)}, paused for ${age(wait)}`);
   }
 
-  /** Credentials refused or a scope missing: kept in /data with the refused pair's fingerprint. */
+  /** Credentials refused or a scope missing: a final stop, kept with the refused pair's fingerprint. */
   async block(kind) {
-    const failures = (this.memory.block?.failures ?? 0) + 1;
-    const wait = TIMINGS.authRetries[Math.min(failures, TIMINGS.authRetries.length) - 1];
     this.memory.block = {
       kind,
-      until: kind === 'scope' ? null : this.now() + wait,
-      failures,
+      failures: (this.memory.block?.failures ?? 0) + 1,
       fp: fingerprintOf(this.memory.salt, this.credKey),
     };
     this.clearRenewTimer();
+    this.clearTimer();
     await this.saveMemory();
     this.logger.warn(
       kind === 'scope'
         ? 'igloohome: a scope is missing; no automatic new try'
-        : `igloohome: credentials refused; next try in ${age(wait)}`,
+        : 'igloohome: credentials refused; no automatic new try',
     );
   }
 
@@ -415,6 +475,7 @@ export class IglooApp {
       .then(() => {
         if (generation === this.generation) {
           this.scheduleRenew();
+          this.updateStatus().catch(() => {});
         }
       })
       .catch((err) => this.renewFailed(err, generation));
@@ -440,14 +501,14 @@ export class IglooApp {
 
   // --- Polling ---------------------------------------------------------------
 
-  /** The next read: the interval, a pause, a block or the backoff, whichever is later. */
+  /** The next read: the interval, a pause or the backoff, whichever is later; none in a block. */
   schedule(delay) {
     this.clearTimer();
     let at = this.earliestRead();
     if (this.online === false) {
       at = Math.max(at, this.nextRetryAt);
     }
-    if (delay === undefined && !Number.isFinite(at)) {
+    if (!Number.isFinite(at)) {
       // A final block: only the test button or other credentials read again.
       return;
     }
@@ -510,14 +571,13 @@ export class IglooApp {
         this.failures = 0;
         this.wait = undefined;
         this.error = undefined;
-        await this.applyRead(result);
-        if (generation !== this.generation) {
-          return;
-        }
         if (this.memory.block || this.memory.pause) {
           this.memory.block = null;
           this.memory.pause = null;
-          await this.saveMemory();
+        }
+        await this.applyRead(result, { save: true });
+        if (generation !== this.generation) {
+          return;
         }
         this.scheduleRenew();
       } catch (err) {
@@ -548,17 +608,37 @@ export class IglooApp {
     }
   }
 
-  /** A device list read: the devices, and the bridge of each commandable lock (kept in /data). */
-  async applyRead({ devices, more }) {
+  /**
+   * A device list read: the devices, the bridge of each commandable lock,
+   * and (`save`, a read of the polling) the success and a bounded summary
+   * kept in /data for a restart.
+   */
+  async applyRead({ devices, more }, { save = false } = {}) {
     this.devices = devices;
     this.more = more;
     this.readAt = this.now();
+    this.stale = false;
     const locks = [...devices.values()]
       .filter(isCommandable)
       .map((d) => ({ id: d.id, bridge: d.bridge }));
     this.bridges = new Map(locks.map((l) => [l.id, l.bridge]));
+    let dirty = false;
     if (JSON.stringify(locks) !== JSON.stringify(this.memory.locks)) {
       this.memory.locks = locks;
+      dirty = true;
+    }
+    if (save) {
+      const summary = { devices: [...devices.values()], more };
+      if (JSON.stringify(summary) !== JSON.stringify(this.memory.summary)) {
+        this.memory.summary = summary;
+        dirty = true;
+      }
+      if (this.now() - this.memory.okAt >= TIMINGS.attemptPersistEvery || dirty) {
+        this.memory.okAt = this.now();
+        dirty = true;
+      }
+    }
+    if (dirty || save) {
       await this.saveMemory();
     }
   }
@@ -596,6 +676,7 @@ export class IglooApp {
     );
     this.failures += 1;
     this.online = false;
+    this.stale = false;
     this.wait = wait;
     this.nextRetryAt = this.now() + wait;
     this.error = reasonOf(err);
@@ -611,9 +692,7 @@ export class IglooApp {
       return [false, config.badAuth === 'invalid' ? T.invalidCredentials : T.noCredentials];
     }
     if (this.blocked) {
-      return this.memory.block.kind === 'scope'
-        ? [false, T.scopeMissing]
-        : [false, T.authRefused(age(this.memory.block.until - this.now()))];
+      return [false, this.memory.block.kind === 'scope' ? T.scopeMissing : T.authRefused];
     }
     if (this.paused) {
       return [false, T.paused(age(this.memory.pause.until - this.now()))];
@@ -625,10 +704,19 @@ export class IglooApp {
       return [false, T.connecting];
     }
     const shown = [...this.devices.values()].filter(isShown);
-    const parts = [
-      T.connected(T.summary(shown.length, shown.filter(isCommandable).length)),
-      T.unlocking(config.allowUnlock),
-    ];
+    const parts = [T.connected(T.summary(shown.length, shown.filter(isCommandable).length))];
+    if (this.stale) {
+      parts.push(
+        T.restored(
+          age(this.now() - this.readAt),
+          age(Math.max(0, this.earliestRead() - this.now())),
+        ),
+      );
+    }
+    parts.push(T.unlocking(config.allowUnlock));
+    if (config.allowUnlock && this.client.unlockDenied) {
+      parts.push(T.unlockScopeMissing);
+    }
     if (this.more) {
       parts.push(T.morePages);
     }
@@ -732,18 +820,24 @@ export class IglooApp {
     }
   }
 
-  /** The last values, for the created features only (the ack never waits for it). */
+  /**
+   * The last values, for the created features only (the ack never waits for
+   * it). A device list kept from before a restart publishes no value: it
+   * would show old values as new.
+   */
   queueStates(created = this.createdFeatures()) {
     const now = this.now();
-    for (const device of this.devices?.values() ?? []) {
-      if (!isShown(device)) {
-        continue;
-      }
-      const ids = deviceIds(this.gladys, device.id);
-      for (const { key, value } of valuesOf(device, now)) {
-        const id = ids.feature(key);
-        if (created.has(id)) {
-          this.publisher.push(id, { state: value });
+    if (!this.stale) {
+      for (const device of this.devices?.values() ?? []) {
+        if (!isShown(device)) {
+          continue;
+        }
+        const ids = deviceIds(this.gladys, device.id);
+        for (const { key, value } of valuesOf(device, now)) {
+          const id = ids.feature(key);
+          if (created.has(id)) {
+            this.publisher.push(id, { state: value });
+          }
         }
       }
     }
@@ -835,7 +929,15 @@ export class IglooApp {
     const now = this.now();
     if (now < this.lastAttemptAt + this.interval) {
       await this.updateStatus();
-      return join(T.test.recent(age(this.lastAttemptAt + this.interval - now)), last());
+      const wait = age(this.lastAttemptAt + this.interval - now);
+      if (this.blocked) {
+        return join(T.test.stopped(age(now - this.lastAttemptAt), wait), last());
+      }
+      return join(T.test.recent(wait), last());
+    }
+    // The unlock scope refused before: asked again (the user may have given it).
+    if (this.client.unlockDenied) {
+      this.client.setUnlock(this.config.allowUnlock);
     }
     const wasBlocked = Boolean(this.memory.block);
     await this.tick({ test: true });
@@ -924,7 +1026,21 @@ export class IglooApp {
     }
   }
 
-  guardActive(lock) {
+  /** The 30 s spacing of the jobs of a bridge (2 a minute). */
+  checkSpacing(bridge) {
+    const lastJob = this.bridgeJobs.get(bridge);
+    if (lastJob !== undefined && this.now() - lastJob < TIMINGS.bridgeSpacing) {
+      throw this.refusal(ERRORS.bridgeBusy(age(lastJob + TIMINGS.bridgeSpacing - this.now())));
+    }
+  }
+
+  /** An unlock of this lock may still run: its guard, or an unlock job watched. */
+  unlockPending(lock) {
+    for (const job of this.jobs.values()) {
+      if (job.lock === lock && job.action === 'unlock') {
+        return true;
+      }
+    }
     const guard = this.guards.get(lock);
     if (guard && this.now() >= guard.until) {
       this.guards.delete(lock);
@@ -961,12 +1077,20 @@ export class IglooApp {
     const answerBy = received + TIMINGS.commandAnswerBy;
     const check = () => this.checkUnlock(ticket, sendBy);
     check();
-    if (this.guardActive(ticket.lock)) {
+    if (this.unlockPending(ticket.lock)) {
       throw this.refusal(ERRORS.justCommanded);
     }
-    if (!this.client.tokenValidFor(TIMINGS.commandTokenValidity)) {
+    if (this.client.unlockDenied) {
+      throw this.refusal(ERRORS.unlockScopeMissing);
+    }
+    // Before the read: a press within 30 s of a job on the known bridge asks nothing.
+    const knownBridge = this.bridges.get(ticket.lock);
+    if (knownBridge) {
+      this.checkSpacing(knownBridge);
+    }
+    if (!this.client.canUnlock || !this.client.tokenValidFor(TIMINGS.commandTokenValidity)) {
       // A token request inside the 3.5 s would leave too little time: asked
-      // now in the background (no loop: one request at a time), refused.
+      // now in the background (no loop: at most one a minute), refused.
       if (this.now() - this.lastRenewAt >= TIMINGS.renewRetry) {
         this.renew();
       }
@@ -1008,18 +1132,17 @@ export class IglooApp {
     if (!device.bridge) {
       throw this.refusal(ERRORS.noBridge);
     }
-    if (this.guardActive(ticket.lock)) {
+    if (this.unlockPending(ticket.lock)) {
       throw this.refusal(ERRORS.justCommanded);
     }
-    const lastJob = this.bridgeJobs.get(device.bridge);
-    if (lastJob !== undefined && this.now() - lastJob < TIMINGS.bridgeSpacing) {
-      throw this.refusal(ERRORS.bridgeBusy(age(lastJob + TIMINGS.bridgeSpacing - this.now())));
-    }
+    this.checkSpacing(device.bridge);
     return this.sendJob(ticket.lock, device.bridge, 'unlock', token, {
       sendBy,
       answerBy,
       check: () => {
         check();
+        // Again right before the first byte: another lock of this bridge may just have sent.
+        this.checkSpacing(device.bridge);
         ticket.sent = true;
       },
     });
@@ -1039,7 +1162,10 @@ export class IglooApp {
     }
     const bridge = this.bridges.get(lock);
     if (!bridge) {
-      throw this.refusal(ERRORS.unknownDevice);
+      const listed = this.devices?.get(lock);
+      throw this.refusal(
+        listed?.type === DEVICE_TYPES.LOCK ? ERRORS.noBridge : ERRORS.unknownDevice,
+      );
     }
     const check = () => {
       if (generation !== this.generation || !this.config.auth) {
@@ -1056,10 +1182,10 @@ export class IglooApp {
       const left = Math.max(0, sendBy - TIMINGS.commandSendMargin - this.now());
       let timer;
       try {
-        // A token request already under way (a renewal) is joined, never
-        // waited for past the deadline.
+        // A token request of a read is joined only when it left just now
+        // (src/client.js), and never waited for past the deadline.
         token = await Promise.race([
-          this.client.fetchToken({ timeout: Math.max(200, left), sendWithin: left }),
+          this.client.lockToken({ timeout: Math.max(200, left), sendWithin: left }),
           new Promise((_, reject) => {
             timer = this.timers.setTimeout(
               () => reject(Object.assign(new Error('late'), { kind: 'late' })),
@@ -1078,15 +1204,24 @@ export class IglooApp {
       }
     }
     check();
-    return this.sendJob(lock, bridge, 'lock', token, { sendBy, answerBy, check });
+    return this.sendJob(lock, bridge, 'lock', token, {
+      sendBy,
+      answerBy,
+      check: () => {
+        check();
+        this.lastLockSentAt.set(lock, this.now());
+      },
+    });
   }
 
-  /** The job request, its answer, the guard (unlock), the reads of its status. */
+  /** The job request, its answer, the guard (unlock), the watch of its status. */
   async sendJob(lock, bridge, action, token, { sendBy, answerBy, check }) {
     const unlock = action === 'unlock';
+    const generation = this.generation;
     const name = `${lock}: ${action} job`;
     this.logger.info(name);
     let jobId;
+    let sentAt;
     try {
       jobId = await this.client.createJob(
         token,
@@ -1099,12 +1234,12 @@ export class IglooApp {
           // The very last check, right before the request leaves.
           beforeSend: () => {
             check();
+            sentAt = this.now();
             this.noteBridgeJob(bridge);
             if (unlock) {
-              // Set before the first byte: a restart now never lets a second unlock through.
-              this.guards.set(lock, {
-                until: this.now() + TIMINGS.jobLifetime + TIMINGS.guardMargin,
-              });
+              // Set before the first byte (written to /data right after):
+              // a restart never lets a second unlock through.
+              this.guards.set(lock, { until: sentAt + GUARD_MAX });
               this.persistGuards();
             }
           },
@@ -1117,13 +1252,18 @@ export class IglooApp {
       const reason = reasonOf(err);
       if (!err.sent) {
         this.logger.warn(`${name} NOT sent (${reason})`);
-        if (unlock) {
+        if (unlock && sentAt !== undefined) {
+          // Its guard was set in beforeSend, but nothing left.
           this.guards.delete(lock);
           this.persistGuards();
         }
         throw this.refusal(err.kind === 'late' ? ERRORS.tooSlow : ERRORS.notSent(reason));
       }
       const answered = ANSWERED.has(err.kind) || (err.kind === 'busy' && err.status === 429);
+      if (generation !== this.generation) {
+        // Other credentials since: nothing written for this one's account.
+        throw this.refusal(answered ? ERRORS.refused(reason) : ERRORS.sentUnconfirmed(reason));
+      }
       if (err.kind === 'busy') {
         await this.pause(err);
         this.updateStatus().catch(() => {});
@@ -1141,11 +1281,15 @@ export class IglooApp {
         throw this.refusal(ERRORS.refused(reason));
       }
       // A silence, a dropped connection, a 5xx, an answer not understood: the
-      // job may have been created. The guard of an unlock stays.
+      // job may have been created. The guard of an unlock stays (its bound).
       this.latestJob.delete(lock);
       this.setLastText(lock, LAST.unconfirmed(action, reason));
       this.logger.warn(`${name} sent, NOT confirmed (${reason})`);
       throw this.refusal(ERRORS.sentUnconfirmed(reason));
+    }
+    if (generation !== this.generation) {
+      // The answer of the previous credentials: exact ack, nothing else.
+      throw this.refusal(ERRORS.accepted);
     }
     if (unlock) {
       const guard = this.guards.get(lock);
@@ -1157,21 +1301,8 @@ export class IglooApp {
     this.latestJob.set(lock, jobId);
     this.setLastText(lock, LAST.accepted(action));
     this.logger.info(`${name} accepted by igloohome`);
-    this.watchJob(lock, action, jobId);
-    // One read of its status if time is left: a job run at once is confirmed.
-    if (answerBy - this.now() >= TIMINGS.ackStatusMin) {
-      try {
-        const job = await this.client.job(token, jobId, {
-          timeout: Math.max(100, answerBy - this.now() - 100),
-        });
-        if (job.completed) {
-          this.jobEnded(lock, action, jobId, true);
-          return;
-        }
-      } catch {
-        // The reads of the watch follow.
-      }
-    }
+    this.trackJob({ id: jobId, lock, action, sentAt: sentAt ?? this.now(), reads: 0 });
+    // Never "done": what a processed job means is not known yet.
     throw this.refusal(ERRORS.accepted);
   }
 
@@ -1182,75 +1313,168 @@ export class IglooApp {
     this.flush().catch(() => {});
   }
 
-  /** Reads of the job status after a command, spaced, none during a pause or a stop. */
-  watchJob(lock, action, jobId) {
+  // --- Jobs ------------------------------------------------------------------
+
+  persistJobs() {
+    if (!this.memory) {
+      return;
+    }
+    this.memory.jobs = [...this.jobs.values()].map(({ id, lock, action, sentAt, expiry }) => ({
+      id,
+      lock,
+      action,
+      sentAt,
+      ...(expiry !== undefined ? { expiry } : {}),
+    }));
+    this.saveMemory().catch(() => {});
+  }
+
+  /** A job accepted: watched to its end (bounded in count: the oldest end "unknown"). */
+  trackJob(job) {
+    this.jobs.set(job.id, job);
+    while (this.jobs.size > TIMINGS.jobsMax) {
+      const oldest = this.jobs.values().next().value;
+      this.jobEnded(oldest, 'unknown');
+    }
+    this.persistJobs();
+    this.scheduleJobRead(job);
+  }
+
+  /**
+   * The end of the watch: a read after the expiry date igloohome gave (when
+   * it gave one), and 15 min after the job left at most.
+   */
+  jobEnd(job) {
+    const max = job.sentAt + TIMINGS.jobWatchMax;
+    if (job.expiry === undefined) {
+      return max;
+    }
+    return Math.min(max, Math.max(job.expiry + TIMINGS.jobReadEvery, job.sentAt));
+  }
+
+  /** The next read of a job: 5, 15, 30, 60, 100, 140 s, then every minute; after a pause. */
+  scheduleJobRead(job, { afterEnd = false } = {}) {
+    if (job.timer) {
+      this.timers.clearTimeout(job.timer);
+    }
+    const now = this.now();
+    const planned = TIMINGS.jobFollowUps[job.reads];
+    let at = planned !== undefined ? job.sentAt + planned : now + TIMINGS.jobReadEvery;
+    if (this.paused) {
+      at = Math.max(at, this.memory.pause.until);
+    }
+    const end = afterEnd ? job.sentAt + TIMINGS.jobWatchMax : this.jobEnd(job);
+    at = Math.min(Math.max(at, now), Math.max(now, end));
     const generation = this.generation;
-    const sentAt = this.now();
-    const delays = TIMINGS.jobFollowUps;
-    delays.forEach((delay, index) => {
-      const handle = this.timers.setTimeout(() => {
-        this.jobTimers.delete(handle);
-        if (generation !== this.generation || this.latestJob.get(lock) !== jobId) {
+    job.timer = this.timers.setTimeout(() => {
+      job.timer = undefined;
+      if (generation === this.generation) {
+        this.readJob(job.id).catch((err) =>
+          this.logger.warn(`Job status failed: ${err?.message ?? 'error'}`),
+        );
+      }
+    }, at - now);
+  }
+
+  /**
+   * One read of a job. Processed -> its end; not processed, read after its
+   * expiry date -> "expired"; anything else (a failure, a pause, a stop) ->
+   * the next read, or "unknown" at the end of the watch. A 429 pauses the
+   * account; a 5xx of this secondary endpoint only skips this read.
+   */
+  async readJob(id) {
+    const job = this.jobs.get(id);
+    if (!job) {
+      return;
+    }
+    const generation = this.generation;
+    job.reads += 1;
+    let answered = false;
+    if (!this.blocked && !this.paused && this.config.auth) {
+      const startedAt = this.now();
+      let result;
+      try {
+        const token = await this.client.validToken({ validity: 10 * SECOND });
+        if (generation !== this.generation) {
           return;
         }
-        this.readJob(lock, action, jobId, { sentAt, last: index === delays.length - 1 }).catch(
-          (err) => this.logger.warn(`Job status failed: ${err?.message ?? 'error'}`),
-        );
-      }, delay);
-      this.jobTimers.add(handle);
-    });
-  }
-
-  async readJob(lock, action, jobId, { sentAt, last }) {
-    const generation = this.generation;
-    const expired = () => last || this.now() >= sentAt + TIMINGS.jobLifetime + TIMINGS.guardMargin;
-    if (this.paused || this.blocked) {
-      if (expired()) {
-        this.jobEnded(lock, action, jobId, false);
+        result = await this.client.job(token, id, { timeout: TIMINGS.readTimeout });
+      } catch (err) {
+        if (generation !== this.generation) {
+          return;
+        }
+        if (err.kind === 'busy' && err.status === 429) {
+          await this.pause(err);
+          await this.updateStatus();
+        }
+        this.logger.info(`${job.lock}: ${job.action} job status not read (${reasonOf(err)})`);
       }
-      return;
-    }
-    let job;
-    try {
-      const token = await this.client.validToken({ validity: 10 * SECOND });
-      if (generation !== this.generation) {
+      if (generation !== this.generation || this.jobs.get(id) !== job) {
         return;
       }
-      job = await this.client.job(token, jobId, { timeout: TIMINGS.readTimeout });
-    } catch (err) {
-      if (generation !== this.generation) {
-        return;
+      // Only the answer about this job counts.
+      if (result && result.id === id) {
+        answered = true;
+        if (result.expiry !== undefined && result.expiry !== job.expiry) {
+          job.expiry = result.expiry;
+          this.persistJobs();
+        }
+        if (result.completed) {
+          this.jobEnded(job, 'processed', result);
+          return;
+        }
+        if (result.expiry !== undefined && startedAt > result.expiry) {
+          this.jobEnded(job, 'expired');
+          return;
+        }
       }
-      if (err.kind === 'busy') {
-        await this.pause(err);
-        await this.updateStatus();
-      }
-      if (expired()) {
-        this.jobEnded(lock, action, jobId, false);
-      }
+    }
+    // Past the expiry date, the watch ends after an answer; a read that did
+    // not happen (a pause, a stop, a failure) goes on until the 15 min.
+    const now = this.now();
+    if (now >= job.sentAt + TIMINGS.jobWatchMax || (answered && now >= this.jobEnd(job))) {
+      this.jobEnded(job, 'unknown');
       return;
     }
-    if (generation !== this.generation || this.latestJob.get(lock) !== jobId) {
-      return;
-    }
-    if (job.completed) {
-      this.jobEnded(lock, action, jobId, true);
-    } else if (expired() || (job.expiry !== undefined && this.now() > job.expiry)) {
-      this.jobEnded(lock, action, jobId, false);
-    }
+    this.scheduleJobRead(job, { afterEnd: !answered && now >= this.jobEnd(job) });
   }
 
-  /** The end of a job: its text, and the guard of an unlock lifted. */
-  jobEnded(lock, action, jobId, completed) {
-    const guard = this.guards.get(lock);
-    if (guard && guard.jobId === jobId) {
-      this.guards.delete(lock);
+  /**
+   * The end of a job: 'processed', 'expired' or 'unknown'. Its text when it
+   * is the latest command of the lock; an alert when an unlock is processed
+   * after a lock sent later; the guard of its unlock lifted.
+   */
+  jobEnded(job, outcome, result) {
+    if (job.timer) {
+      this.timers.clearTimeout(job.timer);
+      job.timer = undefined;
+    }
+    this.jobs.delete(job.id);
+    this.persistJobs();
+    const guard = this.guards.get(job.lock);
+    if (job.action === 'unlock' && guard && guard.jobId === job.id) {
+      this.guards.delete(job.lock);
       this.persistGuards();
     }
-    if (this.latestJob.get(lock) === jobId) {
-      this.latestJob.delete(lock);
-      this.setLastText(lock, completed ? LAST.done(action) : LAST.expired(action));
-      this.logger.info(`${lock}: ${action} job ${completed ? 'completed' : 'not confirmed'}`);
+    if (outcome === 'processed') {
+      this.logger.info(
+        `${job.lock}: ${job.action} job processed (jobResponse keys: ${result?.responseKeys?.join(',') || 'none'})`,
+      );
+    } else {
+      this.logger.info(`${job.lock}: ${job.action} job ${outcome}`);
+    }
+    if (this.latestJob.get(job.lock) === job.id) {
+      this.latestJob.delete(job.lock);
+      this.setLastText(job.lock, LAST[outcome](job.action));
+      return;
+    }
+    if (
+      job.action === 'unlock' &&
+      outcome === 'processed' &&
+      (this.lastLockSentAt.get(job.lock) ?? -Infinity) > job.sentAt
+    ) {
+      this.logger.warn(`${job.lock}: an unlock sent before a lock was processed after it`);
+      this.setLastText(job.lock, LAST.lateUnlock);
     }
   }
 }

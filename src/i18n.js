@@ -41,29 +41,38 @@ const ACTION_NAMES = {
 export const LAST = {
   accepted: (action) =>
     both(
-      `${ACTION_NAMES[action].en}: sent to the bridge, waiting for its confirmation (2 min at most).`,
-      `${ACTION_NAMES[action].fr} : envoyé au bridge, en attente de sa confirmation (2 min au plus).`,
+      `${ACTION_NAMES[action].en}: accepted by igloohome, waiting for the bridge.`,
+      `${ACTION_NAMES[action].fr} : accepté par igloohome, en attente du bridge.`,
     ),
-  done: (action) =>
+  processed: (action) =>
     both(
-      `${ACTION_NAMES[action].en}: job completed by the bridge.`,
-      `${ACTION_NAMES[action].fr} : tâche terminée par le bridge.`,
+      `${ACTION_NAMES[action].en}: job processed by the bridge (result not read: check the lock).`,
+      `${ACTION_NAMES[action].fr} : tâche traitée par le bridge (résultat non lu : vérifiez la serrure).`,
     ),
   expired: (action) =>
     both(
-      `${ACTION_NAMES[action].en}: not confirmed, the job expired (bridge out of reach, low battery?).`,
-      `${ACTION_NAMES[action].fr} : non confirmé, la tâche a expiré (bridge hors de portée, pile faible ?).`,
+      `${ACTION_NAMES[action].en}: not done, igloohome says the job expired (bridge out of reach, low battery?).`,
+      `${ACTION_NAMES[action].fr} : non fait, igloohome indique que la tâche a expiré (bridge hors de portée, pile faible ?).`,
+    ),
+  unknown: (action) =>
+    both(
+      `${ACTION_NAMES[action].en}: sent, without confirmation (result unknown: check the lock).`,
+      `${ACTION_NAMES[action].fr} : envoyé, sans confirmation (résultat inconnu : vérifiez la serrure).`,
     ),
   unconfirmed: (action, reason) =>
     both(
-      `${ACTION_NAMES[action].en}: sent, without confirmation (${reason}).`,
-      `${ACTION_NAMES[action].fr} : envoyé, sans confirmation (${reason}).`,
+      `${ACTION_NAMES[action].en}: sent, without confirmation (${reason}; result unknown: check the lock).`,
+      `${ACTION_NAMES[action].fr} : envoyé, sans confirmation (${reason} ; résultat inconnu : vérifiez la serrure).`,
     ),
   refused: (action, reason) =>
     both(
       `${ACTION_NAMES[action].en}: refused by igloohome (${reason}), nothing done.`,
       `${ACTION_NAMES[action].fr} : refusé par igloohome (${reason}), rien n'a été fait.`,
     ),
+  lateUnlock: both(
+    'An unlock sent before the lock has just been processed by the bridge: the lock may be unlocked, press Lock again.',
+    'Un déverrouillage envoyé avant le verrouillage vient d’être traité par le bridge : la serrure peut être déverrouillée, appuyez de nouveau sur Verrouiller.',
+  ),
 };
 
 export const T = {
@@ -77,6 +86,11 @@ export const T = {
   ),
   connecting: both('Connecting to igloohome…', 'Connexion à igloohome…'),
   connected: (summary) => join(both('Connected:', 'Connecté :'), summary),
+  restored: (ago, next) =>
+    both(
+      `last successful read ${ago} ago (before a restart), next in ${next}.`,
+      `dernière lecture réussie il y a ${ago} (avant un redémarrage), prochaine dans ${next}.`,
+    ),
   summary: (devices, commandable) =>
     both(
       `${devices} device(s), ${commandable} lock(s) commandable through a bridge.`,
@@ -90,19 +104,22 @@ export const T = {
     allowed
       ? both('Unlocking allowed.', 'Déverrouillage autorisé.')
       : both('Unlocking disabled.', 'Déverrouillage désactivé.'),
+  unlockScopeMissing: both(
+    'Unlocking is allowed here, but the API client lacks the unlock right (unlock-bridge-proxied-job): give it in iglooaccess, then use the test button. The rest works.',
+    "Le déverrouillage est autorisé ici, mais le client API n'a pas le droit de déverrouiller (unlock-bridge-proxied-job) : donnez-le-lui dans iglooaccess, puis utilisez le bouton de test. Le reste fonctionne.",
+  ),
   paused: (wait) =>
     both(
       `igloohome asked to wait (HTTP 429 or 5xx): next read in ${wait}. Locking still gets one try.`,
       `igloohome a demandé d'attendre (HTTP 429 ou 5xx) : prochaine lecture dans ${wait}. Le verrouillage a encore droit à un essai.`,
     ),
-  authRefused: (wait) =>
-    both(
-      `igloohome refused the client id or the client secret: check them in iglooaccess (next try in ${wait}, or at once after saving other ones, or with the test button).`,
-      `igloohome a refusé l'identifiant ou le secret client : vérifiez-les dans iglooaccess (nouvel essai dans ${wait}, ou dès l'enregistrement d'autres identifiants, ou avec le bouton de test).`,
-    ),
+  authRefused: both(
+    'igloohome refused the client id or the client secret: check them in iglooaccess and save them again, or use the test button. No automatic new try.',
+    "igloohome a refusé l'identifiant ou le secret client : vérifiez-les dans iglooaccess et enregistrez-les de nouveau, ou utilisez le bouton de test. Pas de nouvel essai automatique.",
+  ),
   scopeMissing: both(
-    'The API client is not allowed what this integration needs (scopes get-devices, lock and unlock bridge jobs, get-job-status): give them to it in iglooaccess, then use the test button. No automatic new try.',
-    "Le client API n'a pas les droits nécessaires à cette intégration (scopes get-devices, tâches bridge de verrouillage et déverrouillage, get-job-status) : donnez-les-lui dans iglooaccess, puis utilisez le bouton de test. Pas de nouvel essai automatique.",
+    'The API client is not allowed what this integration needs (scopes get-devices, lock bridge jobs, get-job-status): give them to it in iglooaccess, then use the test button. No automatic new try.',
+    "Le client API n'a pas les droits nécessaires à cette intégration (scopes get-devices, tâches bridge de verrouillage, get-job-status) : donnez-les-lui dans iglooaccess, puis utilisez le bouton de test. Pas de nouvel essai automatique.",
   ),
   unreachable: (reason, wait) =>
     both(
@@ -114,6 +131,11 @@ export const T = {
       both(
         `Read less than one refresh interval ago (next read in ${wait}). Last result:`,
         `Lu il y a moins d'un intervalle de rafraîchissement (prochaine lecture dans ${wait}). Dernier résultat :`,
+      ),
+    stopped: (ago, wait) =>
+      both(
+        `Stopped: last try ${ago} ago; a new try is possible with this button in ${wait}.`,
+        `Arrêt : dernier essai il y a ${ago} ; nouvel essai possible avec ce bouton dans ${wait}.`,
       ),
     stillRefused: both(
       'The test did not succeed: the stop stays.',
@@ -137,6 +159,10 @@ export const ERRORS = {
   unlockDisabled: both(
     'Unlocking is disabled in the configuration ("Allow unlocking"): nothing sent.',
     "Le déverrouillage est désactivé dans la configuration (« Autoriser le déverrouillage ») : rien n'a été envoyé.",
+  ),
+  unlockScopeMissing: both(
+    'The API client lacks the unlock right in iglooaccess: nothing sent.',
+    "Le client API n'a pas le droit de déverrouiller dans iglooaccess : rien n'a été envoyé.",
   ),
   cancelled: both(
     'Cancelled by a lock command: nothing sent.',
@@ -165,8 +191,8 @@ export const ERRORS = {
       `Le bridge de cette serrure a reçu une tâche il y a moins de 30 s (il en accepte environ 2 par minute) : rien n'a été envoyé, réessayez dans ${wait}.`,
     ),
   justCommanded: both(
-    'An unlock of this lock is still waiting for its bridge (2 min at most): nothing sent.',
-    "Un déverrouillage de cette serrure attend encore son bridge (2 min au plus) : rien n'a été envoyé.",
+    'An unlock of this lock is still waiting for its bridge (or its result is unknown yet): nothing sent.',
+    "Un déverrouillage de cette serrure attend encore son bridge (ou son résultat est encore inconnu) : rien n'a été envoyé.",
   ),
   unknownState: (reason) =>
     both(
@@ -189,11 +215,11 @@ export const ERRORS = {
     ),
   sentUnconfirmed: (reason) =>
     both(
-      `Command sent, without confirmation (${reason}): see "Last command" in a few minutes.`,
-      `Commande envoyée, sans confirmation (${reason}) : voyez « Dernière commande » dans quelques minutes.`,
+      `Command sent, without confirmation (${reason}): see "Last command".`,
+      `Commande envoyée, sans confirmation (${reason}) : voyez « Dernière commande ».`,
     ),
   accepted: both(
-    'Command sent, without confirmation: igloohome accepted it, the bridge has 2 minutes to run it; see "Last command".',
-    "Commande envoyée, sans confirmation : igloohome l'a acceptée, le bridge a 2 minutes pour l'exécuter ; voyez « Dernière commande ».",
+    'Command sent, without confirmation: igloohome accepted it, the bridge has yet to run it; see "Last command".',
+    "Commande envoyée, sans confirmation : igloohome l'a acceptée, le bridge doit encore l'exécuter ; voyez « Dernière commande ».",
   ),
 };

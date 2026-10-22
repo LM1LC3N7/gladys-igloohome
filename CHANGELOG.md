@@ -18,18 +18,28 @@ the notes of the version's GitHub Release.
   Home Assistant integration (Apache-2.0).
 - One Gladys device per device of the account (bridges left out): battery and
   hours since the last sync; for a lock linked to a bridge, Lock and Unlock
-  buttons (never a switch) and the result of the last command read back from
-  the job status.
-- Unlocking is off by default ("Allow unlocking"), checked on arrival, after a
-  fresh read of the device list and right before sending; one unlock at a
-  time per lock, a guard until its job ends (2.5 min at most, kept in
-  `/data`), none within 30 s of another job on the same bridge.
+  buttons (never a switch) and what igloohome says of the job of the last
+  command.
+- Unlocking is off by default ("Allow unlocking", and only then is the unlock
+  scope asked), checked on arrival, after a fresh read of the device list and
+  right before sending; one unlock at a time per lock, none while its job is
+  watched (kept in `/data`), none within 30 s of another job on the same
+  bridge (checked before the read and right before sending).
 - Locking is never blocked: no queue, no read, one try through a pause or a
   stop, possible before the first read after a restart, and it cancels every
-  unlock of the lock not sent yet.
-- Commands sent within 3.5 s or refused unsent; a job accepted is "sent,
-  without confirmation" until its status reads completed.
-- Refused credentials stop with spaced tries (1 h, 6 h, 24 h); a missing scope
-  is a final stop; 429/5xx pause from 1 min to 6 h; all kept in `/data`.
-  Reads never sooner than the interval (15 min by default).
+  unlock of the lock not sent yet (a job igloohome accepted cannot be
+  cancelled: said in the guides).
+- Commands sent within 3.5 s or refused unsent, never answered done: a job
+  accepted is "sent, without confirmation"; every job is watched until
+  igloohome says it was processed ("result not read"), or a read after its
+  expiry date says it expired, or 15 min ("result unknown"); an unlock
+  processed after a later lock raises an alert. The jobs watched survive a
+  restart.
+- Any refusal of the token endpoint but 429/5xx is a final stop (credentials
+  refused or rights missing), lifted by other credentials or a success of
+  the test button; a client without the unlock right still reads and locks.
+  429/5xx pause from 1 min to 6 h; all kept in `/data`. Reads never sooner
+  than the interval (15 min by default).
+- After a restart, the last successful read kept in `/data` gives the
+  status, the Discovery tab and the badges at once.
 - English and French texts and guides, cover image.

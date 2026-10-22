@@ -19,7 +19,8 @@ User guide: [English](docs/en.md) · [Français](docs/fr.md).
 - `GET /devices` every 15 minutes by default (300 s to 1 day), one request for
   the whole account, never sooner than the interval.
 - The commands are bridge jobs (`POST /devices/{id}/jobs/bridges/{bridge}`),
-  confirmed by their status (`GET /jobs/{id}`).
+  never acked "done": each one is watched through its status
+  (`GET /jobs/{id}`) until processed, expired or 15 minutes.
 - OAuth2 client credentials: the token stays in memory, renewed by a timer 5
   minutes before it expires (only while a lock with its buttons is created).
 - The safety rules of the commands are in [CLAUDE.md](CLAUDE.md) and the

@@ -112,15 +112,30 @@ export function parseJobCreated(json) {
   return id;
 }
 
-/** `GET /jobs/{id}` -> `{ id, completed, expiry? }`. Throws without the fields. */
+/**
+ * `GET /jobs/{id}` -> `{ id, completed, expiry?, responseKeys }`. Throws
+ * without the fields. `completed` is only "processed": whether the bridge
+ * succeeded is in `jobResponse`, whose form is unknown yet (milestone 2), so
+ * only its key names are kept (at most 10, for the logs), never its values.
+ */
 export function parseJob(json) {
   const id = idOf(field(json, 'jobId'));
   const completed = field(json, 'completed');
   if (!id || typeof completed !== 'boolean') {
     throw new TypeError('not a job');
   }
+  const response = field(json, 'jobResponse');
+  const responseKeys =
+    response && typeof response === 'object' && !Array.isArray(response)
+      ? Object.keys(response)
+          .slice(0, 10)
+          .map((key) => cleanText(key, 30).replace(/[^\w-]/g, ''))
+          .filter(Boolean)
+      : [];
   const expiry = dateOf(field(json, 'expiryDate'));
-  return expiry === undefined ? { id, completed } : { id, completed, expiry };
+  return expiry === undefined
+    ? { id, completed, responseKeys }
+    : { id, completed, expiry, responseKeys };
 }
 
 /** The devices Gladys shows: every device but the bridges. */

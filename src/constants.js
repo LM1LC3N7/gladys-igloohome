@@ -33,14 +33,15 @@ export const API = {
   baseUrl: 'https://api.igloodeveloper.co/igloohome',
   /**
    * Only the scopes this integration uses (igloohome-api asks for every
-   * scope, PIN creation included: not needed here, so not asked).
+   * scope, PIN creation included: not needed here, so not asked). The
+   * unlock scope only while "Allow unlocking" is on.
    */
-  scope: [
+  scopes: [
     'igloohomeapi/get-devices',
     'igloohomeapi/lock-bridge-proxied-job',
-    'igloohomeapi/unlock-bridge-proxied-job',
     'igloohomeapi/get-job-status',
-  ].join(' '),
+  ],
+  unlockScope: 'igloohomeapi/unlock-bridge-proxied-job',
 };
 
 /** Device types of `GET /devices` (igloohome-api DEVICE_TYPE_*). */
@@ -99,27 +100,35 @@ export const TIMINGS = {
   /** At most one renewal by the timer per this much (a short token never loops). */
   renewRetry: MINUTE,
   /**
-   * A bridge job runs for 2 minutes at most (igloohome support); the guard of
-   * an unlock holds that long plus a margin, unless its job ends sooner.
+   * A job is watched until igloohome says it was processed, or a read made
+   * after its `expiryDate` says it was not, or this long after it was sent
+   * (its life is not documented: igloohome support speaks of 2 minutes).
    */
-  jobLifetime: 2 * MINUTE,
+  jobWatchMax: 15 * MINUTE,
+  /** The guard of an unlock: until its job ends, at most the watch plus this. */
   guardMargin: 30 * SECOND,
   /** The bridge takes about 2 jobs a minute (igloohome support): an unlock waits this long. */
   bridgeSpacing: 30 * SECOND,
-  /** Reads of the job status after a command (none during a pause). */
+  /** Reads of the job status after a command, then one every `jobReadEvery` (none in a pause). */
   jobFollowUps: [5 * SECOND, 15 * SECOND, 30 * SECOND, 60 * SECOND, 100 * SECOND, 140 * SECOND],
-  /** One status read of the job inside the ack, only if this much time is left. */
-  ackStatusMin: 500,
+  jobReadEvery: MINUTE,
+  /** Jobs watched at once, at most (kept in /data). */
+  jobsMax: 20,
+  /** A lock joins a token request under way only when it left less than this ago. */
+  tokenJoinWindow: SECOND,
+  /** The configuration asked again from Gladys when the first ask failed. */
+  configRetries: [5 * SECOND, 30 * SECOND, 2 * MINUTE, 10 * MINUTE],
   /** Transient failures: the next reads, never sooner than the interval. */
   backoff: [MINUTE, 2 * MINUTE, 5 * MINUTE, 15 * MINUTE],
-  /** Credentials refused: the next tries, then every 24 h. */
-  authRetries: [HOUR, 6 * HOUR, 24 * HOUR],
   /** HTTP 429 or 5xx: a pause within these bounds. */
   pauseMin: MINUTE,
   pauseMax: 6 * HOUR,
-  /** The time of the last read is written to /data at most this often. */
+  /** The time of the last read (and of the last success) is written to /data at most this often. */
   attemptPersistEvery: MINUTE,
 };
+
+/** The longest guard after an unlock. */
+export const GUARD_MAX = TIMINGS.jobWatchMax + TIMINGS.guardMargin;
 
 /** Configuration bounds (mirrored by the manifest), in seconds. */
 export const POLL_INTERVAL = { default: 900, min: 300, max: 86400 };
